@@ -1150,10 +1150,10 @@ index 00000000..3cf83d93
 +#endif
 diff --git a/src/ggml-cpu/iqk/iqk_gemm_1bit.cpp b/src/ggml-cpu/iqk/iqk_gemm_1bit.cpp
 new file mode 100644
-index 00000000..43ba7450
+index 00000000..6b28ed75
 --- /dev/null
 +++ b/src/ggml-cpu/iqk/iqk_gemm_1bit.cpp
-@@ -0,0 +1,364 @@
+@@ -0,0 +1,365 @@
 +//
 +// Copyright (C) 2024-2025 Iwan Kawrakow
 +// MIT license
@@ -1194,8 +1194,8 @@ index 00000000..43ba7450
 +// Filled on first use, not by a static initializer: dlopen runs those in every CPU variant library while ggml
 +// scores them, so an AVX512-vectorized initializer would SIGILL on CPUs without AVX512.
 +uint64_t iq1s_grid_us[NGRID_IQ1S];
-+bool iq1s_grid_us_init() {
-+    static const bool ready = [] {
++// GATE PROOF ONLY (do not merge): fill the table from a namespace-scope initializer again, as before the fix.
++const bool iq1s_grid_us_ready = [] {
 +        for (int i = 0; i < NGRID_IQ1S; ++i) {
 +            uint64_t v = 0;
 +            for (int k = 0; k < 8; ++k) {
@@ -1205,7 +1205,8 @@ index 00000000..43ba7450
 +        }
 +        return true;
 +    }();
-+    return ready;
++bool iq1s_grid_us_init() {
++    return iq1s_grid_us_ready;
 +}
 +
 +}
