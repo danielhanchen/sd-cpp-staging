@@ -1,0 +1,262 @@
+ggml Metal: launch contiguous unary, row-broadcast binary and GLU ops with full threadgroups (up to 256
+threads) instead of one thread per threadgroup / one threadgroup per GLU row. Cherry-picked from ggml-org/ggml
+1329f7502b (llama.cpp #31075), the unary / binary / GLU part only (not the MXFP4 mat-vec change).
+
+diff --git a/src/ggml-metal/ggml-metal-ops.cpp b/src/ggml-metal/ggml-metal-ops.cpp
+index ec0b8f2..2761837 100644
+--- a/src/ggml-metal/ggml-metal-ops.cpp
++++ b/src/ggml-metal/ggml-metal-ops.cpp
+@@ -895,7 +895,9 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
+     if (pipeline.cnt) {
+         const int n = pipeline.c4 ? ggml_nelements(op)/4 : ggml_nelements(op);
+ 
+-        ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, 1, 1, 1);
++        const int nth = MIN(256, n);
++
++        ggml_metal_encoder_dispatch_threadgroups(enc, (n + nth - 1)/nth, 1, 1, nth, 1, 1);
+     } else {
+         const int nth_max = MIN(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+         const int nth = MIN(args.ne00, nth_max);
+@@ -948,7 +950,9 @@ int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
+ 
+     const int64_t nrows = ggml_nrows(op->src[0]);
+ 
+-    const int32_t nth = std::max(1, std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), ne00/2));
++    // split each row over several threadgroups: with a single row (decode) one threadgroup would run on one GPU core
++    const int32_t nth = std::max(1, std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), std::min(256, ne0)));
++    const int32_t nk  = (ne0 + nth - 1)/nth;
+ 
+     ggml_metal_encoder_set_pipeline(enc, pipeline);
+     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+@@ -960,7 +964,7 @@ int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
+     }
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+ 
+-    ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, nth, 1, 1);
++    ggml_metal_encoder_dispatch_threadgroups(enc, nk, nrows, 1, nth, 1, 1);
+ 
+     return 1;
+ }
+@@ -4236,7 +4240,9 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
+     ggml_metal_encoder_set_buffer  (enc, bid_dst,  3);
+ 
+     if (pipeline.cnt) {
+-        ggml_metal_encoder_dispatch_threadgroups(enc, args.ne0, ggml_nrows(op), 1, 1, 1, 1);
++        const int nth = MIN(256, args.ne0);
++
++        ggml_metal_encoder_dispatch_threadgroups(enc, (args.ne0 + nth - 1)/nth, ggml_nrows(op), 1, nth, 1, 1);
+     } else {
+         const int nth_max = MIN(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+ 
+diff --git a/src/ggml-metal/kernels/binbcast.metal b/src/ggml-metal/kernels/binbcast.metal
+index 7c7ab9b..74cbcb5 100644
+--- a/src/ggml-metal/kernels/binbcast.metal
++++ b/src/ggml-metal/kernels/binbcast.metal
+@@ -22,8 +22,13 @@ kernel void kernel_bin_fuse_impl(
+ 
+     if (FC_RB) {
+         // row broadcast
+-        const uint i0 = tgpig.y*args.ne00 + tgpig.x;
+-        const uint i1 = FC_CB ? tgpig.x%args.ne10 : tgpig.x;
++        const uint i = tgpig.x*ntg.x + tpitg.x;
++        if (i >= (uint) args.ne0) {
++            return;
++        }
++
++        const uint i0 = tgpig.y*args.ne00 + i;
++        const uint i1 = FC_CB ? i%args.ne10 : i;
+ 
+         device const T0 * src0_row = (device const T0 *) (src0);
+         device       T  * dst_row  = (device       T  *) (dst);
+diff --git a/src/ggml-metal/kernels/unary.metal b/src/ggml-metal/kernels/unary.metal
+index e50a648..c277400 100644
+--- a/src/ggml-metal/kernels/unary.metal
++++ b/src/ggml-metal/kernels/unary.metal
+@@ -20,7 +20,7 @@ kernel void kernel_unary_impl(
+     int i0;
+ 
+     if (FC_CNT) {
+-        i0 = tgpig.x;
++        i0 = tgpig.x*ntg.x + tpitg.x;
+ 
+         src0_ptr = (device const T0 *) (src0);
+         dst_ptr  = (device       T  *) (dst);
+@@ -43,6 +43,10 @@ kernel void kernel_unary_impl(
+             if (i0 >= args.ne0) {
+                 return;
+             }
++        } else {
++            if (i0 >= args.ne00*args.ne01*args.ne02*args.ne03) {
++                return;
++            }
+         }
+ 
+         const TC x = (TC) src0_ptr[i0];
+@@ -209,14 +213,15 @@ kernel void kernel_reglu(
+         device const char * src0,
+         device const char * src1,
+         device       char * dst,
+-        uint tgpig[[threadgroup_position_in_grid]],
+-        uint tpitg[[thread_position_in_threadgroup]],
+-        uint   ntg[[threads_per_threadgroup]]) {
+-    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig*args.nb01) + args.i00;
+-    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig*args.nb11) + args.i10;
+-    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig*args.nb1);
+-
+-    for (int i0 = tpitg; i0 < args.ne0; i0 += ntg) {
++        uint2 tgpig[[threadgroup_position_in_grid]],
++        uint2 tpitg[[thread_position_in_threadgroup]],
++        uint2   ntg[[threads_per_threadgroup]],
++        uint2  ntgs[[threadgroups_per_grid]]) {
++    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig.y*args.nb01) + args.i00;
++    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig.y*args.nb11) + args.i10;
++    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig.y*args.nb1);
++
++    for (int i0 = tgpig.x*ntg.x + tpitg.x; i0 < args.ne0; i0 += ntg.x*ntgs.x) {
+         const float x0 = src0_row[i0];
+         const float x1 = src1_row[i0];
+ 
+@@ -235,14 +240,15 @@ kernel void kernel_geglu(
+         device const char * src0,
+         device const char * src1,
+         device       char * dst,
+-        uint tgpig[[threadgroup_position_in_grid]],
+-        uint tpitg[[thread_position_in_threadgroup]],
+-        uint   ntg[[threads_per_threadgroup]]) {
+-    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig*args.nb01) + args.i00;
+-    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig*args.nb11) + args.i10;
+-    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig*args.nb1);
+-
+-    for (int i0 = tpitg; i0 < args.ne0; i0 += ntg) {
++        uint2 tgpig[[threadgroup_position_in_grid]],
++        uint2 tpitg[[thread_position_in_threadgroup]],
++        uint2   ntg[[threads_per_threadgroup]],
++        uint2  ntgs[[threadgroups_per_grid]]) {
++    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig.y*args.nb01) + args.i00;
++    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig.y*args.nb11) + args.i10;
++    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig.y*args.nb1);
++
++    for (int i0 = tgpig.x*ntg.x + tpitg.x; i0 < args.ne0; i0 += ntg.x*ntgs.x) {
+         const float x0 = src0_row[i0];
+         const float x1 = src1_row[i0];
+ 
+@@ -263,14 +269,15 @@ kernel void kernel_swiglu(
+         device const char * src0,
+         device const char * src1,
+         device       char * dst,
+-        uint tgpig[[threadgroup_position_in_grid]],
+-        uint tpitg[[thread_position_in_threadgroup]],
+-        uint   ntg[[threads_per_threadgroup]]) {
+-    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig*args.nb01) + args.i00;
+-    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig*args.nb11) + args.i10;
+-    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig*args.nb1);
+-
+-    for (int i0 = tpitg; i0 < args.ne0; i0 += ntg) {
++        uint2 tgpig[[threadgroup_position_in_grid]],
++        uint2 tpitg[[thread_position_in_threadgroup]],
++        uint2   ntg[[threads_per_threadgroup]],
++        uint2  ntgs[[threadgroups_per_grid]]) {
++    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig.y*args.nb01) + args.i00;
++    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig.y*args.nb11) + args.i10;
++    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig.y*args.nb1);
++
++    for (int i0 = tgpig.x*ntg.x + tpitg.x; i0 < args.ne0; i0 += ntg.x*ntgs.x) {
+         const float x0 = src0_row[i0];
+         const float x1 = src1_row[i0];
+ 
+@@ -291,14 +298,15 @@ kernel void kernel_swiglu_oai(
+         device const char * src0,
+         device const char * src1,
+         device       char * dst,
+-        uint tgpig[[threadgroup_position_in_grid]],
+-        uint tpitg[[thread_position_in_threadgroup]],
+-        uint   ntg[[threads_per_threadgroup]]) {
+-    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig*args.nb01) + args.i00;
+-    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig*args.nb11) + args.i10;
+-    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig*args.nb1);
+-
+-    for (int i0 = tpitg; i0 < args.ne0; i0 += ntg) {
++        uint2 tgpig[[threadgroup_position_in_grid]],
++        uint2 tpitg[[thread_position_in_threadgroup]],
++        uint2   ntg[[threads_per_threadgroup]],
++        uint2  ntgs[[threadgroups_per_grid]]) {
++    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig.y*args.nb01) + args.i00;
++    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig.y*args.nb11) + args.i10;
++    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig.y*args.nb1);
++
++    for (int i0 = tgpig.x*ntg.x + tpitg.x; i0 < args.ne0; i0 += ntg.x*ntgs.x) {
+         float x0 = src0_row[i0];
+         float x1 = src1_row[i0];
+ 
+@@ -323,14 +331,15 @@ kernel void kernel_swiglu_clamp(
+         device const char * src0,
+         device const char * src1,
+         device       char * dst,
+-        uint tgpig[[threadgroup_position_in_grid]],
+-        uint tpitg[[thread_position_in_threadgroup]],
+-        uint   ntg[[threads_per_threadgroup]]) {
+-    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig*args.nb01) + args.i00;
+-    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig*args.nb11) + args.i10;
+-    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig*args.nb1);
+-
+-    for (int i0 = tpitg; i0 < args.ne0; i0 += ntg) {
++        uint2 tgpig[[threadgroup_position_in_grid]],
++        uint2 tpitg[[thread_position_in_threadgroup]],
++        uint2   ntg[[threads_per_threadgroup]],
++        uint2  ntgs[[threadgroups_per_grid]]) {
++    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig.y*args.nb01) + args.i00;
++    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig.y*args.nb11) + args.i10;
++    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig.y*args.nb1);
++
++    for (int i0 = tgpig.x*ntg.x + tpitg.x; i0 < args.ne0; i0 += ntg.x*ntgs.x) {
+         const float gate = min((float) src0_row[i0], args.limit);
+         const float up = clamp((float) src1_row[i0], -args.limit, args.limit);
+ 
+@@ -349,14 +358,15 @@ kernel void kernel_geglu_erf(
+         device const char * src0,
+         device const char * src1,
+         device       char * dst,
+-        uint tgpig[[threadgroup_position_in_grid]],
+-        uint tpitg[[thread_position_in_threadgroup]],
+-        uint   ntg[[threads_per_threadgroup]]) {
+-    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig*args.nb01) + args.i00;
+-    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig*args.nb11) + args.i10;
+-    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig*args.nb1);
+-
+-    for (int i0 = tpitg; i0 < args.ne0; i0 += ntg) {
++        uint2 tgpig[[threadgroup_position_in_grid]],
++        uint2 tpitg[[thread_position_in_threadgroup]],
++        uint2   ntg[[threads_per_threadgroup]],
++        uint2  ntgs[[threadgroups_per_grid]]) {
++    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig.y*args.nb01) + args.i00;
++    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig.y*args.nb11) + args.i10;
++    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig.y*args.nb1);
++
++    for (int i0 = tgpig.x*ntg.x + tpitg.x; i0 < args.ne0; i0 += ntg.x*ntgs.x) {
+         const float x0 = src0_row[i0];
+         const float x1 = src1_row[i0];
+ 
+@@ -377,14 +387,15 @@ kernel void kernel_geglu_quick(
+         device const char * src0,
+         device const char * src1,
+         device       char * dst,
+-        uint tgpig[[threadgroup_position_in_grid]],
+-        uint tpitg[[thread_position_in_threadgroup]],
+-        uint   ntg[[threads_per_threadgroup]]) {
+-    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig*args.nb01) + args.i00;
+-    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig*args.nb11) + args.i10;
+-    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig*args.nb1);
+-
+-    for (int i0 = tpitg; i0 < args.ne0; i0 += ntg) {
++        uint2 tgpig[[threadgroup_position_in_grid]],
++        uint2 tpitg[[thread_position_in_threadgroup]],
++        uint2   ntg[[threads_per_threadgroup]],
++        uint2  ntgs[[threadgroups_per_grid]]) {
++    device const T * src0_row = (device const T *) ((device const char *) src0 + tgpig.y*args.nb01) + args.i00;
++    device const T * src1_row = (device const T *) ((device const char *) src1 + tgpig.y*args.nb11) + args.i10;
++    device       T * dst_row  = (device       T *) ((device       char *) dst  + tgpig.y*args.nb1);
++
++    for (int i0 = tgpig.x*ntg.x + tpitg.x; i0 < args.ne0; i0 += ntg.x*ntgs.x) {
+         const float x0 = src0_row[i0];
+         const float x1 = src1_row[i0];
+ 
