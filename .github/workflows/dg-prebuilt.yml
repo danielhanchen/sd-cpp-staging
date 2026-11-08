@@ -1,0 +1,390 @@
+# SPDX-License-Identifier: MIT
+# Copyright 2026-present the Unsloth AI Inc. team.
+
+name: "dg-prebuilt (staging: Linux CPU legs)"
+
+# Build and publish our stable-diffusion.cpp (sd-cli + sd-server) prebuilts for
+# CPU, Apple, CUDA, and Vulkan. MiniMax-H3 uses the native engine on GPU hosts too.
+# Vulkan must carry the same H3 and graph-segment fixes as the other backends,
+# rather than sending AMD hosts to an older upstream fallback binary.
+#
+# Shape mirrors unslothai/llama.cpp's prebuilt pipeline, simplified for a 7-way
+# CPU/Apple/Vulkan matrix plus best-effort CUDA legs:
+#   resolve      -- take THIS repository at the requested ref, merge the pinned PR set
+#                   in scripts/unsloth/pr-set.json, stamp a source tarball, name it
+#                   after the upstream release the tree descends from (supply-chain
+#                   aged), decide if our release already exists.
+#   build-unix   -- macOS arm64 (Metal) + x64, Linux x64 + arm64, Linux Vulkan.
+#   build-windows-- Windows x64 CPU + Vulkan (MSVC + Ninja).
+#   build-linux-cuda / build-windows-cuda -- x64, CUDA 12.8 and 13.3, best effort
+#                   (continue-on-error); the CUDA runtime is not bundled, see build-linux-cuda.
+#   assemble     -- fingerprint gate, sha256 + manifest, coverage gate, atomic
+#                   draft->publish. If any CPU/Apple/Vulkan leg fails, assemble
+#                   is skipped and nothing is published (the Studio needs the full
+#                   asset set). The CUDA legs are exempt: each ships when it built and is
+#                   absent when it did not, so it can never hold back the fallbacks.
+#
+# Asset names match the Studio installer's resolve_release_asset.
+#
+# We build THIS repository's tree, not a tarball fetched from anywhere else. Our own fixes are
+# commits here, so there is nothing to re-apply at build time and nothing to keep in step with a
+# foreign tag. The published tag still names the upstream release the tree descends from, so a box
+# can say what it is built on without the build depending on that repository.
+#
+# On top of that tree, scripts/unsloth/pr-set.json can pin pull requests in THIS repository to
+# exact reviewed commits, merged in listed order at build time. That is the same mechanism as
+# unslothai/llama.cpp, with one deliberate difference: there the base is a pristine upstream
+# release and every Unsloth change stays pinned, whereas here the base is our own tree, so a
+# merged fix is simply in it and its pin is deleted. To carry a fix that exists as an upstream
+# pull request, vendor it here as a PR first and pin that; the build never fetches from another
+# repository.
+
+on:
+  push:
+    branches: ['dg-*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sd-prebuilt-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  UNSLOTH_SD_MIN_RELEASE_AGE_HOURS: "6"
+
+jobs:
+  resolve:
+    name: Resolve tag + stamp source
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.r.outputs.tag }}
+      upstream_tag: ${{ steps.r.outputs.upstream_tag }}
+      ahead: ${{ steps.r.outputs.ahead }}
+      pins: ${{ steps.r.outputs.pins }}
+      commit: ${{ steps.r.outputs.commit }}
+      exists: ${{ steps.r.outputs.exists }}
+      source_artifact: ${{ steps.r.outputs.source_artifact }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout this repository with full history, which the tag name is derived from
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - id: r
+        run: |
+          set -euo pipefail
+          AGE_H='${{ github.event.inputs.min_age_hours }}'
+          [ -n "$AGE_H" ] || AGE_H="${UNSLOTH_SD_MIN_RELEASE_AGE_HOURS:-6}"
+
+          # The tree we build is this checkout. The tag still has to say which upstream release
+          # it descends from, so read that from the history rather than from a foreign API.
+          #
+          # HIGHEST reachable release, not nearest. `git describe` answers "nearest", and on a
+          # merge-shaped history that is the wrong answer: this tree reaches master-813 through a
+          # merge 73 commits back and master-811 on its own line 13 commits back, so describe
+          # names it after 811 and understates what it actually contains. The strict regex also
+          # keeps out our own published tags, which live in this repository and carry a -u suffix.
+          UPSTREAM_TAG="$(git tag -l --merged HEAD 'master-*' \
+            | grep -E '^master-[0-9]+-[0-9a-f]+$' | sort -t- -k2,2n | tail -1)"
+          [ -n "$UPSTREAM_TAG" ] || {
+            echo "no upstream release tag is reachable from this ref; cannot name the build" >&2
+            exit 1
+          }
+
+          # Supply-chain aging, kept but re-pointed: it now guards the upstream release the tree
+          # descends from, not the moment we merged it. A tree whose base is hours old is the
+          # thing worth waiting on; our own commits on top are reviewed here.
+          BASE_TS="$(git log -1 --format=%ct "refs/tags/${UPSTREAM_TAG}")"
+          CUTOFF="$(date -u -d "-${AGE_H} hours" +%s)"
+          [ "$BASE_TS" -le "$CUTOFF" ] || {
+            echo "base release ${UPSTREAM_TAG} is younger than ${AGE_H}h; refusing" >&2
+            exit 1
+          }
+
+          # Resolve the PR mix set (scripts/unsloth/pr-set.json). Same mechanism as
+          # unslothai/llama.cpp: an exact, reviewed commit per entry, so an author pushing more
+          # commits cannot change what the nightly ships. Only PRs in THIS repository may be
+          # pinned; to carry an upstream fix, vendor it here as a PR first and pin that.
+          #
+          # The gate lives here rather than only in a lint, because a red lint does not stop the
+          # schedule.
+          jq -e '.prs | type == "array" and all(.[];
+                   type == "string"
+                   or (type == "object" and (.url | type == "string")
+                       and ((if .required == null then true else .required end) | type == "boolean")))' \
+             scripts/unsloth/pr-set.json >/dev/null \
+            || { echo "scripts/unsloth/pr-set.json: .prs must be an array of PR url strings, or {url, required} objects" >&2; exit 1; }
+          PRS='[]'
+          URL_RE='^https://github\.com/unslothai/stable-diffusion\.cpp/pull/([0-9]+)/commits/([0-9a-f]{40})/?$'
+          while read -r url REQUIRED; do
+            [[ "$url" =~ $URL_RE ]] || { echo "refusing malformed PR url '$url' (expected https://github.com/unslothai/stable-diffusion.cpp/pull/<n>/commits/<40-hex-sha>)" >&2; exit 1; }
+            NUM="${BASH_REMATCH[1]}"; SHA="${BASH_REMATCH[2]}"
+            PR_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${NUM}")" \
+              || { echo "refusing #${NUM}: could not fetch PR metadata (nonexistent number in '$url', or a transient API failure); fix the pin or retry" >&2; exit 1; }
+            STATE="$(jq -r '.state' <<<"$PR_JSON")"
+            HEAD_PR="$(jq -r '.head.sha' <<<"$PR_JSON")"
+            N_COMMITS="$(jq -r '.commits' <<<"$PR_JSON")"
+            TITLE="$(jq -r '.title' <<<"$PR_JSON")"
+            if [ "$STATE" != "open" ]; then
+              # Dropping a pin changes SETHASH and the tag, so the release would ship without that
+              # change under a new name. Refuse unless the entry is explicitly optional.
+              if [ "$REQUIRED" != "false" ]; then
+                echo "refusing #${NUM}: pin is ${STATE} and required. If it merged, delete the pin (its commits are already in this tree). Otherwise mark it \"required\": false or repin it." >&2
+                exit 1
+              fi
+              echo "::warning::skipping optional pin #${NUM} (${STATE}): $url"
+              continue
+            fi
+            # A pin pasted from the wrong PR would build arbitrary code while the manifest blames
+            # #<num>. The commits listing is capped at 250; past that, skip rather than false-fail.
+            if [ "$N_COMMITS" -gt 250 ]; then
+              echo "note: #${NUM} has ${N_COMMITS} commits (over the API listing cap); skipping pin membership check"
+            elif ! gh api "repos/${GITHUB_REPOSITORY}/pulls/${NUM}/commits" --paginate --jq '.[].sha' | grep -qx "$SHA"; then
+              echo "refusing #${NUM}: pinned commit ${SHA} is not a commit of that PR (wrong paste, or force-pushed away)" >&2
+              exit 1
+            fi
+            [ "$SHA" = "$HEAD_PR" ] || echo "note: #${NUM} is pinned to ${SHA} but its head has moved to ${HEAD_PR}"
+            echo "including #${NUM} @ ${SHA}"
+            PRS="$(jq -c --arg n "$NUM" --arg s "$SHA" --arg u "$url" --arg t "$TITLE" '. + [{number: ($n|tonumber), sha: $s, url: $u, title: $t}]' <<<"$PRS")"
+          done < <(jq -r '.prs[] | if type == "string" then {url: ., required: true} else . end
+                          | "\(.url)\t\(if .required == null then true else .required end)"' scripts/unsloth/pr-set.json | tr '\t' ' ')
+
+          # Merge the pinned commits onto this tree, in listed order (merge order matters for
+          # conflicts). diff3 so additive_merge.py can see the merge base and refuse to guess on
+          # anything that is not a provable add/add.
+          for row in $(jq -r '.[] | "\(.number):\(.sha)"' <<<"$PRS"); do
+            NUM="${row%%:*}"; SHA="${row##*:}"
+            git fetch -q --no-tags origin "$SHA" \
+              || git fetch -q --no-tags origin "refs/pull/${NUM}/head" \
+              || { echo "could not fetch commit ${SHA} for #${NUM}" >&2; exit 1; }
+            git -c user.name='Unsloth CI' -c user.email='ci@unsloth.ai' \
+                -c merge.conflictStyle=diff3 merge --no-edit "$SHA" && continue
+            python3 scripts/unsloth/additive_merge.py \
+              || { echo "merging #${NUM} conflicts in a way that needs a human; fix the pin" >&2; exit 1; }
+            git -c user.name='Unsloth CI' -c user.email='ci@unsloth.ai' commit --no-edit -q
+            echo "merged #${NUM} with additive conflict resolution"
+          done
+
+          # Always -u<id>: the tree is ours, never a stock upstream one, and the suffix is what
+          # tells Studio's installer to go straight to this repository's releases instead of
+          # trying an upstream download that is guaranteed to 404. With no pins the id is the head
+          # sha; with pins it also hashes the pinned number:sha pairs, so a repin or a reorder
+          # yields a new tag and a rebuild while an unchanged set still matches and skips.
+          HEAD_SHA7="$(git rev-parse --short=7 HEAD)"
+          if [ "$(jq length <<<"$PRS")" = 0 ]; then
+            TAG_ID="$HEAD_SHA7"
+          else
+            TAG_ID="$(jq -r 'map("\(.number):\(.sha)") | join("\n")' <<<"$PRS" \
+              | { cat; echo "$HEAD_SHA7"; } | sha256sum | cut -c1-7)"
+          fi
+          TAG="${UPSTREAM_TAG}-u${TAG_ID}"
+          AHEAD="$(git rev-list --count "refs/tags/${UPSTREAM_TAG}..HEAD")"
+          PIN_LIST="$(jq -r 'map("#\(.number)") | join(",")' <<<"$PRS")"
+          echo "building this repository at ${HEAD_SHA7} (${AHEAD} commits past ${UPSTREAM_TAG}), pins [${PIN_LIST}] -> ${TAG}"
+
+          # Does OUR published release already exist? (drafts don't count.) Checked against the
+          # final tag, so a new commit or a repin republishes instead of matching.
+          EXISTS=false
+          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || true)" = "false" ]; then
+            EXISTS=true
+          fi
+          # ggml is a REQUIRED submodule; the server frontend + libwebp/libwebm are not
+          # (we build with SD_SERVER_BUILD_FRONTEND / SD_WEBP / SD_WEBM off), so fetch only
+          # ggml to keep the source tarball small and the build self-contained.
+          git submodule update --init --recursive --depth 1 ggml
+          # The CUDA build includes cmake/cutlass.cmake, which fails without the CUTLASS headers
+          # (INT8 GEMM and CuTe attention kernels). Only include/ is compiled against, so keep that
+          # and the license and drop the rest of the checkout from the source tarball.
+          git submodule update --init --depth 1 thirdparty/cutlass
+          find thirdparty/cutlass -mindepth 1 -maxdepth 1 ! -name include ! -name LICENSE.txt ! -name .git -exec rm -rf {} +
+          # ggml changes we carry on top of the pinned submodule commit (the submodule points at
+          # leejet/ggml, which we do not push to). A patch that no longer applies fails the build.
+          for p in scripts/unsloth/ggml-patches/*.patch; do
+            [ -e "$p" ] || continue
+            git -C ggml apply --verbose "../$p"
+          done
+          COMMIT="$(git rev-parse HEAD)"
+          SRC_ARTIFACT="sd-source-${TAG}"
+          if [ "$EXISTS" != "true" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tar --exclude-vcs --exclude=.github -czf "${RUNNER_TEMP}/sd-source-${TAG}.tar.gz" .
+            echo "stamped source for ${TAG} (${COMMIT})"
+          else
+            echo "release ${TAG} already published; skipping source prep"
+          fi
+
+          {
+            echo "tag=$TAG"
+            echo "upstream_tag=$UPSTREAM_TAG"
+            echo "ahead=$AHEAD"
+            echo "pins=$PIN_LIST"
+            echo "commit=$COMMIT"
+            echo "exists=$EXISTS"
+            echo "source_artifact=$SRC_ARTIFACT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload source artifact
+        if: ${{ steps.r.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: ${{ steps.r.outputs.source_artifact }}
+          path: ${{ runner.temp }}/sd-source-${{ steps.r.outputs.tag }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  build-unix:
+    name: ${{ matrix.label }}
+    needs: resolve
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux-Ubuntu-22.04-x86_64
+            runner: ubuntu-22.04
+            arch: x86_64
+            defines: ""
+            gate: "false"
+            cpu_floor: x64
+          - label: Linux-Ubuntu-24.04-aarch64
+            runner: ubuntu-24.04-arm
+            arch: aarch64
+            # GCC 13 (the image default) rejects +sme, which the Armv9.2 variants need.
+            defines: "-DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14"
+            gate: "false"
+            cpu_floor: armv8.0_1
+    runs-on: ${{ matrix.runner }}
+    env:
+      VULKAN_VERSION: 1.4.328.1
+      # SDK checksums: https://vulkan.lunarg.com/sdk/files.json
+      VULKAN_SHA256: 241e75b56c91c0d210ed07a7c638ec05a3e5b0e4c66ba9f0ba0f102d823ad6bf
+    steps:
+      - name: Checkout mirror (tooling)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          path: tooling
+          fetch-depth: 1
+
+      - name: Download source @ ${{ needs.resolve.outputs.tag }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: ${{ needs.resolve.outputs.source_artifact }}
+          path: srcpkg
+      - name: Extract source
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/sd-source-${{ needs.resolve.outputs.tag }}.tar.gz" -C src
+
+      - name: Install Vulkan build dependencies
+        if: ${{ matrix.vulkan == 'true' }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev xz-utils
+          # Jammy has no glslc package. Use the SDK tools while building against glibc 2.35.
+          archive="$RUNNER_TEMP/vulkansdk.tar.xz"
+          sdk_root="$RUNNER_TEMP/vulkansdk"
+          curl --fail --location --retry 3 --output "$archive" "https://sdk.lunarg.com/sdk/download/${VULKAN_VERSION}/linux/vulkansdk-linux-x86_64-${VULKAN_VERSION}.tar.xz"
+          echo "$VULKAN_SHA256  $archive" | sha256sum --check --strict
+          mkdir -p "$sdk_root"
+          tar -xJf "$archive" -C "$sdk_root" --strip-components=1
+          echo "VULKAN_SDK=$sdk_root/x86_64" >> "$GITHUB_ENV"
+          echo "$sdk_root/x86_64/bin" >> "$GITHUB_PATH"
+
+      # CPU bundles ship all ggml CPU variants, picked per host at startup; -DGGML_NATIVE=OFF alone
+      # pins AVX2 (SIGILL on older x86) or plain Armv8.0. Metal/Vulkan stay static.
+      - name: Build sd-cli + sd-server
+        working-directory: src
+        run: |
+          set -euo pipefail
+          CPU_VARIANTS=""
+          if [ -n "${{ matrix.cpu_floor }}" ]; then
+            CPU_VARIANTS="-DSD_BUILD_SHARED_GGML_LIB=ON -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON"
+            # macOS: @loader_path only, never an absolute rpath into the build tree.
+            if [ "$(uname -s)" = "Darwin" ]; then
+              CPU_VARIANTS="$CPU_VARIANTS -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH=@loader_path"
+            fi
+          fi
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSD_BUILD_EXAMPLES=ON \
+            -DSD_SERVER_BUILD_FRONTEND=OFF \
+            -DSD_WEBP=OFF -DSD_WEBM=OFF \
+            -DGGML_NATIVE=OFF \
+            $CPU_VARIANTS \
+            ${{ matrix.defines }}
+          if [ "$(uname -s)" = "Darwin" ]; then J="$(sysctl -n hw.logicalcpu)"; else J="$(nproc)"; fi
+          cmake --build build --config Release -j "$J" --target sd-cli sd-server
+
+      - name: Pin the bundle's own ggml (CPU variants)
+        if: ${{ matrix.cpu_floor != '' && runner.os == 'Linux' }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq patchelf
+          bash tooling/scripts/unsloth/cpu_variants_gate.sh pin src/build/bin
+
+      - name: macOS load gate
+        if: ${{ matrix.gate == 'true' }}
+        run: |
+          set -eux
+          # deploy target is the trailing number in defines
+          DT="$(echo '${{ matrix.defines }}' | sed -E 's/.*CMAKE_OSX_DEPLOYMENT_TARGET=([0-9.]+).*/\1/')"
+          bash tooling/scripts/unsloth/assert_macho_minos.sh src/build/bin "${{ matrix.arch }}" "$DT"
+
+      - name: Package bundle
+        env:
+          BIN_DIR: ${{ github.workspace }}/src/build/bin
+          OUT_DIR: ${{ github.workspace }}/dist
+          TAG: ${{ needs.resolve.outputs.tag }}
+          LABEL: ${{ matrix.label }}
+          COMMIT: ${{ needs.resolve.outputs.commit }}
+          SOURCE_REPO: ${{ github.repository }}
+          LICENSE_FILE: ${{ github.workspace }}/src/LICENSE
+        run: python3 tooling/scripts/unsloth/package_bundle.py
+
+      - name: CPU variants gate
+        if: ${{ matrix.cpu_floor != '' }}
+        run: bash tooling/scripts/unsloth/cpu_variants_gate.sh check "dist/sd-${{ needs.resolve.outputs.tag }}-bin-${{ matrix.label }}.zip" "${{ matrix.cpu_floor }}"
+
+      # The runner has the newest ISA the bundle uses, so it cannot see a variant library that crashes
+      # older CPUs while ggml dlopens every variant to score it. Replay startup on emulated CPUs: Intel SDE
+      # Nehalem .. Sapphire Rapids on x86_64, qemu Cortex-A53 .. max on aarch64.
+      - name: CPU dispatch gate (emulated CPUs)
+        if: ${{ matrix.cpu_floor != '' && runner.os == 'Linux' }}
+        run: |
+          set -euo pipefail
+          if [ "$(uname -m)" = "aarch64" ]; then sudo apt-get install -y -qq qemu-user; fi
+          bash tooling/scripts/unsloth/cpu_dispatch_gate.sh "dist/sd-${{ needs.resolve.outputs.tag }}-bin-${{ matrix.label }}.zip"
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: sd-${{ needs.resolve.outputs.tag }}-bin-${{ matrix.label }}
+          path: dist/sd-${{ needs.resolve.outputs.tag }}-bin-${{ matrix.label }}.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  # Linux CUDA. GPU hosts also need native inference for MiniMax-H3: its Diffusers path needs about
+  # 68.5 GB of VRAM, so every consumer card falls back to the GGUF engine, which on Linux had
+  # no accelerated build at all. Measured on one box: 65 s/step at 320x192 on 96 CPU threads,
+  # against 21.5 s/step at 960x544 from a CUDA build. That is the difference between a render
+  # taking four hours and taking eleven minutes.
+  #
+  # One bundle per CUDA major, and no CUDA runtime in any of them. Studio always installs
+  # unslothai/llama.cpp, whose CUDA build links the same cudart / cublas / cublasLt and already
+  # resolves them on every CUDA host (the venv's torch and nvidia-* wheels, CUDA_PATH, the paired
+  # cudart archive on Windows). Studio picks the bundle whose major matches that llama.cpp build
+  # and hands sd-cli the same directories, so the toolkits here match llama.cpp's cuda12 / cuda13
+  # lines. ggml is a shared library so sd-cli and sd-server share one copy of the CUDA kernels.
+  #
+  # continue-on-error, and deliberately so. The CPU and Apple assets are what Studio falls back
+  # to, and a CUDA toolchain failure must never stop them publishing. assemble collects bundles
+  # by the sd-*-bin-* pattern, so this asset appears when it built and is simply absent when it
+  # did not; the coverage gate requires CPU/Apple/Vulkan assets but leaves CUDA optional.
