@@ -1,0 +1,506 @@
+{
+ "refs": {
+  "M": {
+   "ref": "origin/master"
+  },
+  "H": {
+   "pr": 49
+  },
+  "K": {
+   "branch": "cpu-sgemm-legacy-quants"
+  },
+  "T": {
+   "branch": "cpu-kquant-tiled-first"
+  },
+  "U": {
+   "branch": "dg-gm-union",
+   "remote": "https://github.com/danielhanchen/sd-cpp-staging"
+  }
+ },
+ "legs": {
+  "lx64": {
+   "variants": true,
+   "pin_variants": [
+    "haswell"
+   ]
+  },
+  "la64": {
+   "variants": true,
+   "defines": [
+    "-DCMAKE_C_COMPILER=gcc-14",
+    "-DCMAKE_CXX_COMPILER=g++-14"
+   ]
+  },
+  "marm": {
+   "defines": [
+    "-DSD_METAL=ON",
+    "-DGGML_METAL_EMBED_LIBRARY=ON",
+    "-DGGML_BLAS=ON",
+    "-DGGML_BLAS_VENDOR=Apple",
+    "-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0"
+   ]
+  },
+  "mx64": {
+   "variants": true,
+   "pin_variants": [
+    "haswell"
+   ],
+   "defines": [
+    "-DSD_METAL=OFF",
+    "-DGGML_BLAS=OFF",
+    "-DCMAKE_OSX_DEPLOYMENT_TARGET=13.3"
+   ]
+  }
+ },
+ "shards": {
+  "op": {
+   "kind": "op",
+   "reps": 3,
+   "inner": 3,
+   "types": [
+    "f16",
+    "bf16",
+    "q8_0",
+    "q4_0",
+    "q4_1",
+    "q5_0",
+    "q5_1",
+    "q2_K",
+    "q3_K",
+    "q4_K",
+    "q5_K",
+    "q6_K",
+    "iq1_s",
+    "iq1_m",
+    "iq2_xxs",
+    "iq2_xs",
+    "iq2_s",
+    "iq3_xxs",
+    "iq3_s",
+    "iq4_nl",
+    "iq4_xs"
+   ],
+   "shapes": [
+    "3072,3072,1024",
+    "9728,2560,128"
+   ],
+   "envs": [
+    {},
+    {
+     "GGML_CPU_SGEMM_TYPES": "q8_0,q4_0,q5_0,iq4_nl,f16,bf16"
+    }
+   ],
+   "tbo": {
+    "marm": [
+     "test:Metal:MUL_MAT"
+    ]
+   }
+  },
+  "dA": {
+   "kind": "dit",
+   "types": [
+    "BF16",
+    "Q8_0",
+    "Q6_K",
+    "Q5_K_M",
+    "Q5_K_S"
+   ]
+  },
+  "dB": {
+   "kind": "dit",
+   "types": [
+    "F16",
+    "Q5_1",
+    "Q5_0",
+    "Q4_K_M",
+    "Q4_K_S"
+   ]
+  },
+  "dC": {
+   "kind": "dit",
+   "types": [
+    "Q4_1",
+    "Q4_0",
+    "Q3_K_M",
+    "Q3_K_S",
+    "Q2_K"
+   ]
+  },
+  "te": {
+   "kind": "te",
+   "reps": 2,
+   "dm": "Q4_0",
+   "types": [
+    "BF16",
+    "Q8_0",
+    "Q4_K_M",
+    "Q4_0",
+    "Q4_1",
+    "IQ4_XS",
+    "IQ4_NL",
+    "UD-Q4_K_XL",
+    "UD-IQ3_XXS",
+    "UD-IQ2_XXS",
+    "UD-IQ1_S"
+   ]
+  },
+  "mA": {
+   "kind": "dit",
+   "types": [
+    "Q6_K",
+    "Q5_K_M",
+    "Q5_1",
+    "Q5_0"
+   ],
+   "arms": [
+    {
+     "id": "d",
+     "env": {}
+    },
+    {
+     "id": "noblas",
+     "env": {
+      "SD_CPU_BLAS": "0"
+     }
+    }
+   ]
+  },
+  "mB": {
+   "kind": "dit",
+   "types": [
+    "Q4_K_M",
+    "Q4_1",
+    "Q4_0",
+    "Q3_K_M",
+    "Q2_K"
+   ],
+   "arms": [
+    {
+     "id": "d",
+     "env": {}
+    },
+    {
+     "id": "noblas",
+     "env": {
+      "SD_CPU_BLAS": "0"
+     }
+    }
+   ]
+  },
+  "op2": {
+   "kind": "op",
+   "refs": [
+    "H",
+    "K"
+   ],
+   "reps": 3,
+   "inner": 3,
+   "types": [
+    "f16",
+    "bf16",
+    "q8_0",
+    "q4_0",
+    "q4_1",
+    "q5_0",
+    "q5_1",
+    "q2_K",
+    "q3_K",
+    "q4_K",
+    "q5_K",
+    "q6_K",
+    "iq1_s",
+    "iq1_m",
+    "iq2_xxs",
+    "iq2_xs",
+    "iq2_s",
+    "iq3_xxs",
+    "iq3_s",
+    "iq4_nl",
+    "iq4_xs"
+   ],
+   "shapes": [
+    "3072,3072,1024",
+    "9728,2560,128"
+   ],
+   "envs": [
+    {}
+   ],
+   "tbo": {
+    "marm": [
+     "test:Metal:MUL_MAT"
+    ],
+    "lx64": [
+     "test:CPU:MUL_MAT"
+    ],
+    "la64": [
+     "test:CPU:MUL_MAT"
+    ],
+    "mx64": [
+     "test:CPU:MUL_MAT"
+    ]
+   }
+  },
+  "kA": {
+   "kind": "dit",
+   "refs": [
+    "H",
+    "K"
+   ],
+   "types": [
+    "BF16",
+    "F16",
+    "Q4_0"
+   ],
+   "timeout": 1500
+  },
+  "kB": {
+   "kind": "dit",
+   "refs": [
+    "H",
+    "K"
+   ],
+   "types": [
+    "Q5_1",
+    "Q5_0",
+    "Q4_1"
+   ]
+  },
+  "kM": {
+   "kind": "dit",
+   "refs": [
+    "H",
+    "K"
+   ],
+   "types": [
+    "Q5_1",
+    "Q5_0",
+    "Q4_1",
+    "Q4_0"
+   ],
+   "arms": [
+    {
+     "id": "d",
+     "env": {}
+    },
+    {
+     "id": "noblas",
+     "env": {
+      "SD_CPU_BLAS": "0"
+     }
+    }
+   ]
+  },
+  "kt": {
+   "kind": "te",
+   "refs": [
+    "H",
+    "K"
+   ],
+   "reps": 3,
+   "dm": "Q4_0",
+   "types": [
+    "BF16",
+    "Q4_1",
+    "Q4_K_M"
+   ],
+   "timeout": 1500
+  },
+  "tb": {
+   "kind": "op",
+   "refs": [
+    "M",
+    "H",
+    "K"
+   ],
+   "reps": 1,
+   "inner": 2,
+   "types": [
+    "f16",
+    "bf16",
+    "q4_0",
+    "q4_1",
+    "q5_0",
+    "q5_1",
+    "q8_0",
+    "q4_K",
+    "iq4_nl"
+   ],
+   "shapes": [
+    "3072,3072,1024"
+   ],
+   "envs": [
+    {}
+   ],
+   "tbo": {
+    "marm": [
+     "test:MTL0:MUL_MAT",
+     "test:CPU:MUL_MAT"
+    ],
+    "la64": [
+     "test:CPU:MUL_MAT"
+    ]
+   }
+  },
+  "op4": {
+   "kind": "op",
+   "refs": [
+    "H",
+    "K"
+   ],
+   "reps": 3,
+   "inner": 3,
+   "types": [
+    "f16",
+    "bf16",
+    "q4_0",
+    "q4_1",
+    "q5_0",
+    "q5_1",
+    "q8_0"
+   ],
+   "shapes": [
+    "3072,3072,1024",
+    "9728,2560,128"
+   ],
+   "envs": [
+    {}
+   ],
+   "tbo": {
+    "la64": [
+     "test:CPU:MUL_MAT"
+    ]
+   }
+  },
+  "kB2": {
+   "kind": "dit",
+   "refs": [
+    "H",
+    "K"
+   ],
+   "types": [
+    "Q5_0",
+    "Q5_1",
+    "Q4_1"
+   ]
+  },
+  "kF": {
+   "kind": "dit",
+   "refs": [
+    "H",
+    "K"
+   ],
+   "types": [
+    "BF16",
+    "F16"
+   ],
+   "timeout": 1200
+  },
+  "kTF": {
+   "kind": "te",
+   "refs": [
+    "H",
+    "K"
+   ],
+   "reps": 3,
+   "dm": "Q4_0",
+   "types": [
+    "BF16"
+   ],
+   "timeout": 1200
+  },
+  "op6": {
+   "kind": "op",
+   "refs": [
+    "K",
+    "T"
+   ],
+   "reps": 3,
+   "inner": 3,
+   "types": [
+    "q2_K",
+    "q3_K",
+    "q4_K",
+    "q5_K",
+    "q6_K",
+    "iq4_xs",
+    "q4_0",
+    "q8_0"
+   ],
+   "shapes": [
+    "3072,3072,1024",
+    "9728,2560,128"
+   ],
+   "envs": [
+    {}
+   ],
+   "tbo": {
+    "lx64": [
+     "test:CPU:MUL_MAT"
+    ]
+   }
+  },
+  "kT": {
+   "kind": "dit",
+   "refs": [
+    "K",
+    "T"
+   ],
+   "types": [
+    "Q4_K_M",
+    "Q5_K_M",
+    "Q6_K",
+    "Q2_K"
+   ]
+  },
+  "op7": {
+   "kind": "op",
+   "refs": [
+    "H",
+    "U"
+   ],
+   "reps": 3,
+   "inner": 3,
+   "types": [
+    "f16",
+    "bf16",
+    "q8_0",
+    "q4_0",
+    "q4_1",
+    "q5_0",
+    "q5_1",
+    "q4_K",
+    "q5_K",
+    "q6_K",
+    "q3_K",
+    "q2_K",
+    "iq4_nl",
+    "iq4_xs"
+   ],
+   "shapes": [
+    "3072,3072,1024",
+    "9728,2560,128"
+   ],
+   "envs": [
+    {}
+   ],
+   "tbo": {
+    "la64": [
+     "test:CPU:MUL_MAT"
+    ]
+   }
+  },
+  "kU": {
+   "kind": "dit",
+   "refs": [
+    "H",
+    "U"
+   ],
+   "types": [
+    "Q4_K_M",
+    "Q8_0",
+    "Q4_1",
+    "Q5_0"
+   ]
+  }
+ }
+}
