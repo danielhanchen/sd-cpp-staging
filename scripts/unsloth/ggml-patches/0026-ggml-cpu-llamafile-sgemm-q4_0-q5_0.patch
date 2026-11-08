@@ -1,0 +1,31 @@
+x86: Q4_0 and Q5_0 weights take llamafile tinyBLAS by default, like Q8_0 (same bits as vec_dot, only faster).
+IQ4_NL stays opt-in (GGML_CPU_SGEMM_TYPES): its tinyBLAS result differs from vec_dot.
+
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index 51246c4..b9ae731 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -72,10 +72,12 @@ static void ggml_cpu_sgemm_cpuid(unsigned leaf, unsigned r[4]) {
+ 
+ // Weight types whose mul_mat may go through llamafile's tinyBLAS GEMM. Q8_0: its tinyBLAS kernel adds the per-block
+ // products in the same 8 lanes and the same final reduction as ggml_vec_dot_q8_0_q8_0, so it returns the same bits,
+-// only faster. F16 / BF16: both paths read the same F16 / BF16 activations and accumulate in F32, only in another
++// only faster. Q4_0 / Q5_0 on x86: the same tinyBLAS_Q0_AVX kernel, unpacking the weights to the same int8 values
++// as ggml_vec_dot_q4_0_q8_0 / ggml_vec_dot_q5_0_q8_0, so also the same bits (IQ4_NL does not return the same bits
++// and stays opt-in). F16 / BF16: both paths read the same F16 / BF16 activations and accumulate in F32, only in another
+ // order (the text encoder, VAE and DiT F16 / BF16 matmuls). F32 doubles the rms error vs an F64 GEMM and stays
+ // opt-in. GGML_CPU_SGEMM_TYPES=q8_0,bf16,f16,f32 (ggml type names), "all" or "none" overrides the default below;
+-// GGML_CPU_SGEMM_TYPES=q8_0 restores the bit-identical-only set.
++// GGML_CPU_SGEMM_TYPES=q8_0,q4_0,q5_0 restores the bit-identical-only set.
+ //
+ // Default, per measured SD1.5 F16 sampling (tinyBLAS vs vec_dot, same machine): Q8_0 on every x86 build (1.06-1.12x,
+ // same bits). F16 / BF16 where tinyBLAS was faster or equal:
+@@ -92,7 +94,7 @@ static uint64_t ggml_cpu_sgemm_types_default(void) {
+     const uint64_t f16 = (1ull << GGML_TYPE_F16) | (1ull << GGML_TYPE_BF16);
+     uint64_t mask = 0;
+ #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+-    mask |= 1ull << GGML_TYPE_Q8_0;
++    mask |= (1ull << GGML_TYPE_Q8_0) | (1ull << GGML_TYPE_Q4_0) | (1ull << GGML_TYPE_Q5_0);
+ #endif
+ #if defined(__AVX512F__)
+     mask |= f16;
