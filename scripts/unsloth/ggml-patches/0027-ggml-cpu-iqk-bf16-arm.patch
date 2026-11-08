@@ -1,0 +1,339 @@
+CPU (aarch64): BF16 weights x F32 activations through an iqk GEMM ported from ik_llama.cpp
+(iqk_gemm_floats.cpp, commit 009dce19). ggml_vec_dot_bf16 has no NEON path, so a BF16 mul_mat on ARM ran a
+scalar loop. Same switches as the other iqk kernels: GGML_CPU_IQK=0 or GGML_CPU_IQK_TYPES without bf16.
+
+diff --git a/src/ggml-cpu/CMakeLists.txt b/src/ggml-cpu/CMakeLists.txt
+index 9bcd600..1600973 100644
+--- a/src/ggml-cpu/CMakeLists.txt
++++ b/src/ggml-cpu/CMakeLists.txt
+@@ -51,6 +51,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
+         ggml-cpu/iqk/iqk_gemm_kquants.cpp
+         ggml-cpu/iqk/iqk_gemm_iquants.cpp
+         ggml-cpu/iqk/iqk_gemm_1bit.cpp
++        ggml-cpu/iqk/iqk_gemm_floats.cpp
+         ggml-cpu/ggml-cpu-impl.h
+         ggml-cpu/common.h
+         ggml-cpu/binary-ops.h
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index 51246c4..dbe3694 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -1418,6 +1418,28 @@ void ggml_compute_forward_mul_mat(
+     // nb01 >= nb00 - src0 is not transposed
+     //   compute by src0 rows
+ 
++#if defined(__aarch64__)
++    // BF16 weights on ARM: ggml_vec_dot_bf16 has no NEON path (a scalar loop with a double accumulator after src1 is
++    // converted to BF16), so the iqk kernel takes the F32 activations as they are.
++    if (!params->use_ref && src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
++        ggml_is_contiguous(src1) && ne00 % 4 == 0 && ggml_cpu_iqk_type_enabled(GGML_TYPE_BF16)) {
++        const int64_t r2b = ne12 / ne02;
++        const int64_t r3b = ne13 / ne03;
++        bool done = true;
++        for (int64_t i13 = 0; i13 < ne13 && done; i13++) {
++            for (int64_t i12 = 0; i12 < ne12 && done; i12++) {
++                const char * a = (const char *) src0->data + i12/r2b*nb02 + i13/r3b*nb03;
++                const float * b = (const float *) ((const char *) src1->data + i12*nb12 + i13*nb13);
++                float * c = (float *) ((char *) dst->data + i12*nb2 + i13*nb3);
++                done = ggml_cpu_iqk_mul_mat_bf16(ne01, ne11, ne00, a, nb01, b, nb11, c, nb1/sizeof(float), ith, nth);
++            }
++        }
++        if (done) {
++            return;
++        }
++    }
++#endif
++
+     // TODO: extract to "extra_op"
+ #if GGML_USE_LLAMAFILE
+     // broadcast factors
+diff --git a/src/ggml-cpu/iqk/iqk_common.h b/src/ggml-cpu/iqk/iqk_common.h
+index 478cf1a..94c9d15 100644
+--- a/src/ggml-cpu/iqk/iqk_common.h
++++ b/src/ggml-cpu/iqk/iqk_common.h
+@@ -133,6 +133,10 @@ typedef void (*mul_mat_t)(int n, const void * vx, size_t bx, const DataInfo& inf
+ bool iqk_set_kernels_kquants(int typeA, mul_mat_t * funcs);
+ bool iqk_set_kernels_iquants(int typeA, mul_mat_t * funcs);
+ bool iqk_set_kernels_1bit(int typeA, mul_mat_t * funcs);
++#ifdef __aarch64__
++// BF16 weights x F32 activation rows (iqk_gemm_floats.cpp): funcs[0..4] for 1..5 activation rows, ne00 % 4 == 0
++bool iqk_set_kernels_bf16_f32(int ne00, mul_mat_t * funcs);
++#endif
+ 
+ // ==================================================================================================
+ 
+diff --git a/src/ggml-cpu/iqk/iqk_gemm.cpp b/src/ggml-cpu/iqk/iqk_gemm.cpp
+index 6551112..afd0122 100644
+--- a/src/ggml-cpu/iqk/iqk_gemm.cpp
++++ b/src/ggml-cpu/iqk/iqk_gemm.cpp
+@@ -46,7 +46,12 @@ constexpr uint64_t iqk_type_bit(ggml_type t) { return 1ull << (int) t; }
+     iqk_type_bit(GGML_TYPE_Q5_K)    | iqk_type_bit(GGML_TYPE_Q6_K)   | iqk_type_bit(GGML_TYPE_IQ4_XS) |
+     iqk_type_bit(GGML_TYPE_IQ2_XXS) | iqk_type_bit(GGML_TYPE_IQ2_XS) | iqk_type_bit(GGML_TYPE_IQ2_S) |
+     iqk_type_bit(GGML_TYPE_IQ3_XXS) | iqk_type_bit(GGML_TYPE_IQ3_S)  | iqk_type_bit(GGML_TYPE_IQ1_S) |
+-    iqk_type_bit(GGML_TYPE_IQ1_M);
++    iqk_type_bit(GGML_TYPE_IQ1_M)
++#if defined(__aarch64__)
++    // BF16 weights with F32 activations (ggml_cpu_iqk_mul_mat_bf16), ARM only: x86 has tinyBLAS for BF16
++    | iqk_type_bit(GGML_TYPE_BF16)
++#endif
++    ;
+ 
+ #ifdef IQK_IMPLEMENT
+ constexpr uint64_t k_iqk_built_types = k_iqk_all_types;
+@@ -115,6 +120,33 @@ void iqk_mul_mat_NxM(const mul_mat_t * funcs, int n, const void * vx, size_t bx,
+     }
+ }
+ 
++// Tiles of rows x activation columns: the rows are split over the threads first (each thread then walks all
++// columns of its row range, 64 rows x up to 8 columns per kernel call); with fewer than 16 rows per thread the
++// columns are split too.
++void iqk_mul_mat_tiles(const mul_mat_t * funcs, int64_t Nx, int64_t Ny, int64_t ne00, const void * A, size_t stride_A,
++                       const void * B, size_t stride_B, float * C, size_t stride_C, int ith, int nth) {
++    const int nx = (int) Nx;
++    const int ny = (int) Ny;
++    int ntile_x = nth < nx/16 ? nth : (nx/16 > 0 ? nx/16 : 1);
++    int ntile_y = nth/ntile_x;
++    if (ntile_y > (ny + 7)/8) ntile_y = (ny + 7)/8;
++    if (ntile_y < 1) ntile_y = 1;
++    const int ntile = ntile_x*ntile_y;
++    for (int itile = ith; itile < ntile; itile += nth) {
++        const int jx = itile % ntile_x;
++        const int jy = itile / ntile_x;
++        const int ix0 = (int)((int64_t) jx      * nx / ntile_x);
++        const int ix1 = (int)((int64_t)(jx + 1) * nx / ntile_x);
++        const int iy0 = (int)((int64_t) jy      * ny / ntile_y);
++        const int iy1 = (int)((int64_t)(jy + 1) * ny / ntile_y);
++        if (ix1 <= ix0 || iy1 <= iy0) {
++            continue;
++        }
++        DataInfo info{C + ix0, (const char *) B, stride_C, stride_B, iy0};
++        iqk_mul_mat_NxM(funcs, (int) ne00, (const char *) A + ix0*stride_A, stride_A, info, ix1 - ix0, iy1);
++    }
++}
++
+ #endif // IQK_IMPLEMENT
+ 
+ } // namespace
+@@ -224,32 +256,38 @@ bool ggml_cpu_iqk_mul_mat(int type, int64_t Nx, int64_t Ny, int64_t ne00,
+         }
+     }
+ 
+-    // Tiles of rows x activation columns: the rows are split over the threads first (each thread then walks all
+-    // columns of its row range, 64 rows x up to 8 columns per kernel call); with fewer than 16 rows per thread the
+-    // columns are split too.
+-    const int nx = (int) Nx;
+-    const int ny = (int) Ny;
+-    int ntile_x = nth < nx/16 ? nth : (nx/16 > 0 ? nx/16 : 1);
+-    int ntile_y = nth/ntile_x;
+-    if (ntile_y > (ny + 7)/8) ntile_y = (ny + 7)/8;
+-    if (ntile_y < 1) ntile_y = 1;
+-    const int ntile = ntile_x*ntile_y;
+-    for (int itile = ith; itile < ntile; itile += nth) {
+-        const int jx = itile % ntile_x;
+-        const int jy = itile / ntile_x;
+-        const int ix0 = (int)((int64_t) jx      * nx / ntile_x);
+-        const int ix1 = (int)((int64_t)(jx + 1) * nx / ntile_x);
+-        const int iy0 = (int)((int64_t) jy      * ny / ntile_y);
+-        const int iy1 = (int)((int64_t)(jy + 1) * ny / ntile_y);
+-        if (ix1 <= ix0 || iy1 <= iy0) {
+-            continue;
++    iqk_mul_mat_tiles(funcs, Nx, Ny, ne00, A, stride_A, B, stride_B, C, stride_C, ith, nth);
++    return true;
++#else
++    (void) type; (void) Nx; (void) Ny; (void) ne00; (void) A; (void) stride_A; (void) B; (void) stride_B;
++    (void) C; (void) stride_C; (void) ith; (void) nth;
++    return false;
++#endif
++}
++
++bool ggml_cpu_iqk_mul_mat_bf16(int64_t Nx, int64_t Ny, int64_t ne00,
++                               const void * A, size_t stride_A, const float * B, size_t stride_B,
++                               float * C, size_t stride_C, int ith, int nth) {
++#if defined(IQK_IMPLEMENT) && defined(__aarch64__)
++    if (!ggml_cpu_iqk_type_enabled(GGML_TYPE_BF16) || ne00 % 4 != 0 || Nx <= 0 || Ny <= 0 || Nx > INT32_MAX ||
++        Ny > INT32_MAX || ne00 > INT32_MAX) {
++        return false;
++    }
++    mul_mat_t funcs[IQK_MAX_NY];
++    if (!iqk_set_kernels_bf16_f32((int) ne00, funcs)) {
++        return false;
++    }
++    if (ith == 0) {
++        const int64_t prev = g_iqk_count[GGML_TYPE_BF16].fetch_add(1, std::memory_order_relaxed);
++        if (g_iqk_debug && prev == 0) {
++            fprintf(stderr, "ggml-cpu iqk gemm: first bf16 x f32 mul_mat (%lld x %lld x %lld, %d threads)\n",
++                    (long long) Nx, (long long) Ny, (long long) ne00, nth);
+         }
+-        DataInfo info{C + ix0, (const char *) B, stride_C, stride_B, iy0};
+-        iqk_mul_mat_NxM(funcs, (int) ne00, (const char *) A + ix0*stride_A, stride_A, info, ix1 - ix0, iy1);
+     }
++    iqk_mul_mat_tiles(funcs, Nx, Ny, ne00, A, stride_A, B, stride_B, C, stride_C, ith, nth);
+     return true;
+ #else
+-    (void) type; (void) Nx; (void) Ny; (void) ne00; (void) A; (void) stride_A; (void) B; (void) stride_B;
++    (void) Nx; (void) Ny; (void) ne00; (void) A; (void) stride_A; (void) B; (void) stride_B;
+     (void) C; (void) stride_C; (void) ith; (void) nth;
+     return false;
+ #endif
+diff --git a/src/ggml-cpu/iqk/iqk_gemm.h b/src/ggml-cpu/iqk/iqk_gemm.h
+index a36b5d7..21da0e5 100644
+--- a/src/ggml-cpu/iqk/iqk_gemm.h
++++ b/src/ggml-cpu/iqk/iqk_gemm.h
+@@ -35,6 +35,13 @@ bool ggml_cpu_iqk_mul_mat(int type, int64_t Nx, int64_t Ny, int64_t ne00,
+                           const void * A, size_t stride_A, const void * B, size_t stride_B,
+                           float * C, size_t stride_C, int ith, int nth);
+ 
++// aarch64: C[iy*stride_C + ix] = dot(A row ix, B row iy) for BF16 rows A (stride_A bytes) and F32 rows B (stride_B
++// bytes), ne00 % 4 == 0, on plain NEON (ggml_vec_dot_bf16 has no ARM path). Enabled like the types above ("bf16" in
++// GGML_CPU_IQK_TYPES, off with GGML_CPU_IQK=0); returns false (computing nothing) elsewhere.
++bool ggml_cpu_iqk_mul_mat_bf16(int64_t Nx, int64_t Ny, int64_t ne00,
++                               const void * A, size_t stride_A, const float * B, size_t stride_B,
++                               float * C, size_t stride_C, int ith, int nth);
++
+ // test hooks (reached through the CPU backend's get_proc_address): number of mul_mat ops computed by
+ // these kernels per weight type, and an override of the enabled type mask (bit = ggml type)
+ int64_t ggml_cpu_iqk_count(int type);
+diff --git a/src/ggml-cpu/iqk/iqk_gemm_floats.cpp b/src/ggml-cpu/iqk/iqk_gemm_floats.cpp
+new file mode 100644
+index 0000000..9bdf146
+--- /dev/null
++++ b/src/ggml-cpu/iqk/iqk_gemm_floats.cpp
+@@ -0,0 +1,138 @@
++//
++// Copyright (C) 2024-2025 Iwan Kawrakow
++// MIT license
++// SPDX-License-Identifier: MIT
++//
++// Adapted from ik_llama.cpp (https://github.com/ikawrakow/ik_llama.cpp) commit 009dce19,
++// ggml/src/iqk/iqk_gemm_floats.cpp (the __aarch64__ part: QBF16 / QF32 and mul_mat_Qx_Qy_T).
++// Only the BF16 weights x F32 activations kernels are kept.
++//
++// Permission is hereby granted, free of charge, to any person obtaining a copy
++// of this software and associated documentation files (the "Software"), to deal
++// in the Software without restriction, including without limitation the rights
++// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++// copies of the Software, and to permit persons to whom the Software is
++// furnished to do so, subject to the following conditions:
++//
++// The above copyright notice and this permission notice shall be included in all
++// copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++// SOFTWARE.
++//
++//
++// BF16 weights times F32 activations on aarch64 with plain NEON: each BF16 value is widened to F32 by a 16-bit shift
++// (exact) and multiplied into F32 accumulators of 4 lanes, 5 weight rows x up to 5 activation rows per call. ggml's
++// vec_dot_bf16 has no NEON path, so without this a BF16 mul_mat on ARM converts the activations to BF16 and runs a
++// scalar loop with a double accumulator.
++
++#include "iqk_common.h"
++
++#if defined IQK_IMPLEMENT && defined __aarch64__
++
++namespace {
++
++struct QBF16Base {
++    constexpr static int k_step = 4;
++    using Data = float32x4_t;
++    using Acc  = float32x4_t;
++    static inline Data load(const uint16_t * x) { return vreinterpretq_f32_u32(vshlq_n_u32(vmovl_u16(vld1_u16(x)), 16)); }
++    static inline Acc acc(Acc prev, const Data& y, const Data& x) { return vfmaq_f32(prev, y, x); }
++    static inline Acc acc_first(const Data& y, const Data& x) { return vmulq_f32(y, x); }
++    static inline float hsum(Acc acc) { return vaddvq_f32(acc); }
++};
++template <int nrc> struct QBF16 final : public QBF16Base {
++    using Base = QBF16Base;
++    constexpr static int nrc_y = nrc;
++    QBF16(const char * cx, size_t bx) {
++        for (int iy = 0; iy < nrc_y; ++iy) y[iy] = (const uint16_t *)(cx + iy*bx);
++    }
++    IQK_ALWAYS_INLINE Data load1(int iy, int i) const { return load(y[iy] + k_step*i); }
++    const uint16_t * y[nrc_y];
++};
++
++struct QF32Base {
++    constexpr static int k_step = 4;
++    using Data = float32x4_t;
++    static inline Data load(const float * x) { return vld1q_f32(x); }
++};
++template <int nrc> struct QF32 final : public QF32Base {
++    using Base = QF32Base;
++    constexpr static int nrc_y = nrc;
++    QF32(const DataInfo& info) {
++        for (int iy = 0; iy < nrc_y; ++iy) y[iy] = (const float *)info.src1_row(iy);
++    }
++    IQK_ALWAYS_INLINE Data load1(int iy, int i) const { return load(y[iy] + k_step*i); }
++    const float * y[nrc_y];
++};
++
++// rows [ix0, ix0 + Qx::nrc_y) of the weights times the activation rows of info; n % 4 == 0
++template <typename Qy, typename Qx>
++IQK_NOINLINE void mul_mat_Qx_Qy_NxN(int n, const char * cx, size_t bx, int ix0, const DataInfo& info) {
++    static_assert(Qx::Base::k_step == Qy::Base::k_step, "k_step");
++    const int nb = n/Qx::Base::k_step;
++    Qy y(info);
++    Qx x(cx + ix0*bx, bx);
++    typename Qx::Base::Data xv[Qx::nrc_y];
++    typename Qx::Base::Acc  acc[Qx::nrc_y*Qy::nrc_y];
++    auto yv = y.load1(0, 0);
++    for (int ix = 0; ix < Qx::nrc_y; ++ix) {
++        xv[ix] = x.load1(ix, 0);
++        acc[ix] = Qx::Base::acc_first(yv, xv[ix]);
++    }
++    for (int iy = 1; iy < Qy::nrc_y; ++iy) {
++        yv = y.load1(iy, 0);
++        for (int ix = 0; ix < Qx::nrc_y; ++ix) acc[Qx::nrc_y*iy + ix] = Qx::Base::acc_first(yv, xv[ix]);
++    }
++    for (int i = 1; i < nb; ++i) {
++        yv = y.load1(0, i);
++        for (int ix = 0; ix < Qx::nrc_y; ++ix) {
++            xv[ix] = x.load1(ix, i);
++            acc[ix] = Qx::Base::acc(acc[ix], yv, xv[ix]);
++        }
++        for (int iy = 1; iy < Qy::nrc_y; ++iy) {
++            yv = y.load1(iy, i);
++            for (int ix = 0; ix < Qx::nrc_y; ++ix) acc[Qx::nrc_y*iy + ix] = Qx::Base::acc(acc[Qx::nrc_y*iy + ix], yv, xv[ix]);
++        }
++    }
++    for (int iy = 0; iy < Qy::nrc_y; ++iy) for (int ix = 0; ix < Qx::nrc_y; ++ix) info.store(ix0+ix, iy, Qx::Base::hsum(acc[Qx::nrc_y*iy+ix]));
++}
++
++template <typename Qy, template<int> typename Qx>
++void mul_mat_Qx_Qy_T(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
++    constexpr int k_nx = 5;
++    const char * cx = (const char *)vx;
++    for (int ix = 0; ix < nrc_x/k_nx; ++ix) {
++        mul_mat_Qx_Qy_NxN<Qy, Qx<k_nx>>(n, cx, bx, ix*k_nx, info);
++    }
++    const int last_x = k_nx*(nrc_x/k_nx);
++    switch (nrc_x - last_x) {
++        case 1: mul_mat_Qx_Qy_NxN<Qy, Qx<1>>(n, cx, bx, last_x, info); break;
++        case 2: mul_mat_Qx_Qy_NxN<Qy, Qx<2>>(n, cx, bx, last_x, info); break;
++        case 3: mul_mat_Qx_Qy_NxN<Qy, Qx<3>>(n, cx, bx, last_x, info); break;
++        case 4: mul_mat_Qx_Qy_NxN<Qy, Qx<4>>(n, cx, bx, last_x, info); break;
++        default: break;
++    }
++}
++
++} // namespace
++
++bool iqk_set_kernels_bf16_f32(int ne00, mul_mat_t * funcs) {
++    if (ne00 % 4 != 0) {
++        return false;
++    }
++    for (int i = 0; i < IQK_MAX_NY; ++i) funcs[i] = nullptr;
++    funcs[0] = mul_mat_Qx_Qy_T<QF32<1>, QBF16>;
++    funcs[1] = mul_mat_Qx_Qy_T<QF32<2>, QBF16>;
++    funcs[2] = mul_mat_Qx_Qy_T<QF32<3>, QBF16>;
++    funcs[3] = mul_mat_Qx_Qy_T<QF32<4>, QBF16>;
++    funcs[4] = mul_mat_Qx_Qy_T<QF32<5>, QBF16>;
++    return true;
++}
++
++#endif // IQK_IMPLEMENT && __aarch64__
