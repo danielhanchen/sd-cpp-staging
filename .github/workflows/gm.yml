@@ -1,0 +1,49 @@
+name: gm
+on:
+  push:
+    branches: ['gm-*']
+permissions:
+  contents: read
+jobs:
+  leg:
+    name: ${{ matrix.leg }}-${{ matrix.shard }}${{ matrix.i }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{"leg": "lx64", "shard": "op6", "runner": "ubuntu-latest", "i": ""}, {"leg": "lx64", "shard": "op6", "runner": "ubuntu-22.04", "i": "b"}, {"leg": "lx64", "shard": "op6", "runner": "ubuntu-24.04", "i": "c"}, {"leg": "lx64", "shard": "kT", "runner": "ubuntu-latest", "i": ""}, {"leg": "lx64", "shard": "kT", "runner": "ubuntu-22.04", "i": "b"}]
+    env:
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_NOHASHDIR: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with: {path: h}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - name: Ninja + ccache
+        shell: bash
+        run: |
+          python -m pip install -q ninja
+          case "$RUNNER_OS" in
+            Linux) sudo apt-get update -qq && sudo apt-get install -y -qq ccache ;;
+            macOS) brew install -q ccache || true ;;
+          esac
+          df -h . | tail -1
+      - name: Free disk (Linux)
+        if: runner.os == 'Linux'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true; df -h . | tail -1
+      - name: Build + measure
+        shell: bash
+        run: |
+          set -o pipefail
+          python -u h/gm/run.py --leg ${{ matrix.leg }} --shard ${{ matrix.shard }} 2>&1 | tee run.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: res-${{ matrix.leg }}-${{ matrix.shard }}${{ matrix.i }}
+          path: |
+            art
+            run.log
+            w/out/*.png
+          retention-days: 7
