@@ -29,6 +29,9 @@ FILES = {
     "umt5": "city96/umt5-xxl-encoder-gguf/resolve/main/umt5-xxl-encoder-Q4_K_M.gguf",
 }
 PROMPT = "a photo of a red fox sitting in fresh snow, golden hour, detailed fur"
+# Wan's default negative prompt (docs/wan.md), the long one Studio users get
+WAN_NEG = ("色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，"
+           "画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走")
 SPEED = ["--diffusion-fa", "--diffusion-conv-direct"]  # Studio native speed flags on CPU
 LOG = open(ART / "driver.log", "a")
 IS_MAC = sys.platform == "darwin"
@@ -114,6 +117,10 @@ def case_args(c):
         return ["-M", "vid_gen", "--diffusion-model", fetch("wan"), "--t5xxl", fetch("umt5"), "--vae", fetch("wvae"), "--cfg-scale", "6",
                 "--steps", "2", "-W", "480", "-H", "320", "--video-frames", "9", "--flow-shift", "3.0", "--sampling-method", "euler",
                 "-n", "blurry"], 2, "%03d.png"
+    if c == "wan_small":
+        return ["-M", "vid_gen", "--diffusion-model", fetch("wan"), "--t5xxl", fetch("umt5"), "--vae", fetch("wvae"), "--cfg-scale", "6",
+                "--steps", "2", "-W", "320", "-H", "192", "--video-frames", "5", "--flow-shift", "3.0", "--sampling-method", "euler",
+                "-n", WAN_NEG], 2, "%03d.png"
     raise ValueError(c)
 
 
@@ -144,11 +151,6 @@ def prof(bins, cases, threads, flags):
     for c in cases:
         r = run_case(exe, c, str(out / c), threads, flags, env=dict(os.environ, GGML_CPU_PROF="1"))
         say("prof", c, json.dumps(r))
-
-
-def frames(prefix):
-    fs = sorted(glob.glob(prefix + "*.png")) if "%" not in prefix else []
-    return fs
 
 
 def compare(a_prefix, b_prefix):
