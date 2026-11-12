@@ -1,0 +1,88 @@
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index 032fe4c..64825c4 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -3316,6 +3316,46 @@ static int ggml_cpu_try_fuse_ops(
+     return 0;
+ }
+ 
++
++// ---- scratch per-node profiler (GGML_CPU_PROF=1), not for shipping ----
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++typedef struct { char key[160]; double t; long n; } gcp_ent;
++#define GCP_N 4096
++static gcp_ent gcp_tab[GCP_N]; static int gcp_used = 0; static int gcp_on = -1;
++static long gcp_seg_runs = 0; static double gcp_seg_t = 0;
++static double gcp_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec * 1e-9; }
++static int gcp_cmp(const void * a, const void * b) { double x = ((const gcp_ent *) a)->t, y = ((const gcp_ent *) b)->t; return x < y ? 1 : x > y ? -1 : 0; }
++static const char * gcp_tag = "tail";
++static void gcp_dump(void) {
++    if (gcp_used == 0) return;
++    qsort(gcp_tab, GCP_N, sizeof(gcp_ent), gcp_cmp);
++    double tot = 0; for (int i = 0; i < gcp_used; i++) tot += gcp_tab[i].t;
++    fprintf(stderr, "GCP_SEG [%s] graphs=%ld node_sum_s=%.3f graph_wall_s=%.3f\n", gcp_tag, gcp_seg_runs, tot, gcp_seg_t);
++    for (int i = 0; i < gcp_used; i++) {
++        if (gcp_tab[i].t / tot < 0.002 && i > 40) break;
++        fprintf(stderr, "GCP %8.3f s %5.1f%% n=%-7ld %s\n", gcp_tab[i].t, 100 * gcp_tab[i].t / tot, gcp_tab[i].n, gcp_tab[i].key);
++    }
++    memset(gcp_tab, 0, sizeof gcp_tab);
++    gcp_used = 0; gcp_seg_runs = 0; gcp_seg_t = 0;
++}
++__attribute__((visibility("default"))) void ggml_cpu_prof_tag(const char * tag);
++void ggml_cpu_prof_tag(const char * tag) { static char b[200]; snprintf(b, sizeof b, "%s", tag); gcp_tag = b; gcp_dump(); gcp_tag = "tail"; }
++static void gcp_add(const char * key, double t) {
++    unsigned h = 5381; for (const char * c = key; *c; c++) h = h * 33 + (unsigned char) *c;
++    for (int i = 0; i < GCP_N; i++) {
++        int j = (h + i) % GCP_N;
++        if (gcp_tab[j].key[0] == 0) { snprintf(gcp_tab[j].key, sizeof gcp_tab[j].key, "%s", key); gcp_tab[j].t = t; gcp_tab[j].n = 1; gcp_used++; return; }
++        if (strcmp(gcp_tab[j].key, key) == 0) { gcp_tab[j].t += t; gcp_tab[j].n++; return; }
++    }
++}
++static void gcp_key(const struct ggml_tensor * node, int n_fused, char * buf, size_t len) {
++    const struct ggml_tensor * a = node->src[0]; const struct ggml_tensor * b = node->src[1];
++    int o = snprintf(buf, len, "%s%s %s", ggml_op_desc(node), n_fused > 0 ? "+FUSED" : "", ggml_type_name(node->type));
++    if (a) o += snprintf(buf + o, len - o, " a=%s[%lld,%lld,%lld,%lld]%s", ggml_type_name(a->type), (long long) a->ne[0], (long long) a->ne[1], (long long) a->ne[2], (long long) a->ne[3], ggml_is_contiguous(a) ? "" : "nc");
++    if (b && o < (int) len) o += snprintf(buf + o, len - o, " b=%s[%lld,%lld,%lld,%lld]%s", ggml_type_name(b->type), (long long) b->ne[0], (long long) b->ne[1], (long long) b->ne[2], (long long) b->ne[3], ggml_is_contiguous(b) ? "" : "nc");
++}
+ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+     struct ggml_threadpool    * tp    = state->threadpool;
+@@ -3358,6 +3398,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+ 
+         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
+         // Try fused ops, fall back to normal compute
++        const double gcp_t0 = (gcp_on > 0 && state->ith == 0) ? gcp_now() : 0;
++        const int gcp_node_n = node_n;
+         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+         if (n_fused > 0) {
+             node_n += n_fused;
+@@ -3374,6 +3416,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+         if (node_n + 1 < cgraph->n_nodes) {
+             ggml_barrier(state->threadpool);
+         }
++        if (gcp_on > 0 && state->ith == 0) {
++            char k[160]; gcp_key(cgraph->nodes[gcp_node_n], n_fused, k, sizeof k);
++            gcp_add(k, gcp_now() - gcp_t0);
++        }
+     }
+ 
+ #ifdef GGML_USE_OPENMP
+@@ -3608,6 +3654,8 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
+ 
+ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
+     ggml_cpu_init();
++    if (gcp_on < 0) { gcp_on = getenv("GGML_CPU_PROF") ? 1 : 0; if (gcp_on) atexit(gcp_dump); }
++    const double gcp_w0 = gcp_on > 0 ? gcp_now() : 0;
+ 
+     GGML_ASSERT(cplan);
+     GGML_ASSERT(cplan->n_threads > 0);
+@@ -3675,6 +3723,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+     clear_numa_thread_affinity();
+ 
+     enum ggml_status ret = threadpool->ec;
++    if (gcp_on > 0) { gcp_seg_runs++; gcp_seg_t += gcp_now() - gcp_w0; }
+ 
+     if (disposable_threadpool) {
+         ggml_threadpool_free(threadpool);

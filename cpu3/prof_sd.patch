@@ -1,0 +1,21 @@
+diff --git a/src/core/util.cpp b/src/core/util.cpp
+index 0eeaa41..8d8a158 100644
+--- a/src/core/util.cpp
++++ b/src/core/util.cpp
+@@ -1,4 +1,5 @@
+ #include "core/util.h"
++extern "C" void ggml_cpu_prof_tag(const char*) __attribute__((weak));
+ #include <algorithm>
+ #include <cctype>
+ #include <cmath>
+@@ -743,6 +744,10 @@ void log_printf(sd_log_level_t level, const char* file, int line, const char* fo
+     va_end(args);
+     std::string origin = sd_format("%s:%d", sd_basename(file).c_str(), line);
+     sd_log_dispatch(level, origin, message);
++    static void (*prof_tag)(const char*) = getenv("GGML_CPU_PROF") ? ggml_cpu_prof_tag : nullptr;
++    if (prof_tag && message.find("completed, taking") != std::string::npos) {
++        prof_tag(message.c_str());
++    }
+ }
+ 
+ void sd_ggml_log_callback(ggml_log_level level, const char* text, void*) {

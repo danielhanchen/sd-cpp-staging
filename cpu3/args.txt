@@ -1,0 +1,1 @@
+--steps build,prof --arms base=cpu3-base,prof=cpu3-base+prof_ggml.patch+prof_sd.patch --prof-cases k2_512,k2_1024,k3_512,wan

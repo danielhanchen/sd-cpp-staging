@@ -1,0 +1,56 @@
+name: cpu3
+on:
+  push:
+    branches: ['sdrc-cpu3-*']
+permissions:
+  contents: read
+jobs:
+  leg:
+    name: ${{ matrix.leg }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: linux_x64
+            runner: ubuntu-latest
+            defines: "-DGGML_NATIVE=ON"
+            flags: ""
+          - leg: macos15
+            runner: macos-15
+            defines: "-DSD_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=Apple -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0"
+            flags: "--backend cpu"
+          - leg: linux_arm64
+            runner: ubuntu-24.04-arm
+            defines: "-DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 -DGGML_NATIVE=ON"
+            flags: ""
+    env:
+      CCACHE_MAXSIZE: 4G
+    steps:
+      - uses: actions/checkout@v4
+        with: {path: h}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - name: tools
+        shell: bash
+        run: |
+          python -m pip install -q ninja numpy pillow
+          case "$RUNNER_OS" in
+            Linux) sudo apt-get update -qq && sudo apt-get install -y -qq ccache gcc-14 g++-14 time ;;
+            macOS) brew install -q ccache || true ;;
+          esac
+          sysctl -n machdep.cpu.brand_string 2>/dev/null || lscpu | head -20
+      - name: run
+        shell: bash
+        run: |
+          set -o pipefail
+          python -u h/cpu3/cpu3_remote.py --defines="${{ matrix.defines }}" --flags="${{ matrix.flags }}" $(cat h/cpu3/args.txt) 2>&1 | tee run.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cpu3-${{ matrix.leg }}
+          path: |
+            art
+            run.log
+          retention-days: 7
