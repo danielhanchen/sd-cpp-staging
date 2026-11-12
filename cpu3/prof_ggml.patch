@@ -1,5 +1,5 @@
 diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
-index 032fe4c..64825c4 100644
+index 032fe4c..b24fec0 100644
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
 @@ -3316,6 +3316,46 @@ static int ggml_cpu_try_fuse_ops(
@@ -78,11 +78,18 @@ index 032fe4c..64825c4 100644
  
      GGML_ASSERT(cplan);
      GGML_ASSERT(cplan->n_threads > 0);
-@@ -3675,6 +3723,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -3675,6 +3723,14 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
      clear_numa_thread_affinity();
  
      enum ggml_status ret = threadpool->ec;
-+    if (gcp_on > 0) { gcp_seg_runs++; gcp_seg_t += gcp_now() - gcp_w0; }
++    if (gcp_on > 0) {
++        const double gw = gcp_now() - gcp_w0; gcp_seg_runs++; gcp_seg_t += gw;
++        if (getenv("GGML_CPU_PROF_GRAPHS")) {
++            char k[160]; snprintf(k, sizeof k, "~GRAPH nodes=%d thr=%d first=%s last=%s", cgraph->n_nodes, n_threads,
++                cgraph->n_nodes ? ggml_op_desc(cgraph->nodes[0]) : "-", cgraph->n_nodes ? ggml_op_desc(cgraph->nodes[cgraph->n_nodes-1]) : "-");
++            gcp_add(k, gw);
++        }
++    }
  
      if (disposable_threadpool) {
          ggml_threadpool_free(threadpool);

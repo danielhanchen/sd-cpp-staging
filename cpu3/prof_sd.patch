@@ -1,3 +1,90 @@
+diff --git a/src/core/ggml_runner.cpp b/src/core/ggml_runner.cpp
+index e9d5dd0..cd8e9d9 100644
+--- a/src/core/ggml_runner.cpp
++++ b/src/core/ggml_runner.cpp
+@@ -11,6 +11,12 @@
+ #include "core/segment_graph_bindings.h"
+ #include "core/segment_weight_pipeline.h"
+ 
++#include <chrono>
++#include <cstdio>
++static inline double sdp_now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
++static const bool sdp_on = getenv("SD_PROF_HOST") != nullptr;
++#define SDP_MARK(var) const double var = sdp_on ? sdp_now() : 0
++
+ using namespace sd;
+ 
+ ggml_tensor* ggml_ext_attention_ext(GGMLRunnerContext* ctx,
+@@ -680,10 +686,12 @@ std::optional<sd::Tensor<float>> GGMLRunner::compute(get_graph_cb_t get_graph,
+         }
+     } graph_guard{*this, success};
+ 
++    SDP_MARK(sdp_c0);
+     ggml_cgraph* graph = nullptr;
+     if (!prepare_compute_graph(get_graph, &graph)) {
+         return std::nullopt;
+     }
++    SDP_MARK(sdp_c1);
+     params_tensor_set_dirty_ = true;
+     rebuild_params_tensor_set();
+     if (auto manager = residency_manager.lock()) {
+@@ -693,9 +701,11 @@ std::optional<sd::Tensor<float>> GGMLRunner::compute(get_graph_cb_t get_graph,
+                 params_tensor_set_.insert(parameter);
+         }
+     }
++    SDP_MARK(sdp_c2);
+     std::optional<sd::Tensor<float>> output;
+     try {
+         output = execute_graph(graph, n_threads, no_return, read_outputs);
++        if (sdp_on) fprintf(stderr, "SDP %s build=%.1fms params=%.1fms exec=%.1fms nodes=%d\n", get_desc().c_str(), 1e3*(sdp_c1-sdp_c0), 1e3*(sdp_c2-sdp_c1), 1e3*(sdp_now()-sdp_c2), ggml_graph_n_nodes(graph));
+     } catch (const std::bad_alloc&) {
+         last_compute_status_ = GGML_STATUS_ALLOC_FAILED;
+         LOG_ERROR("%s graph allocation failed", get_desc().c_str());
+@@ -891,8 +901,10 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
+     if (!assign_graph_cut_layer_split_backends(graph)) {
+         return std::nullopt;
+     }
++    SDP_MARK(sdp_e0);
+     const auto params       = collect_used_param_tensors(graph);
+     const auto& cached_plan = resolve_graph_cut_plan(graph);
++    SDP_MARK(sdp_e1);
+     auto manager            = residency_manager.lock();
+     const bool can_segment  = !is_multi_device() && !sd_backend_is_cpu(runtime_backend) &&
+                               manager != nullptr && manager->segmented_compute_enabled() &&
+@@ -902,6 +914,7 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
+     ComputeWorkspace::Measurement full_measurement;
+     if (!segmented) {
+         full_measurement = measure(graph);
++        if (sdp_on) fprintf(stderr, "SDP   collect+plan=%.1fms measure=%.1fms\n", 1e3*(sdp_e1-sdp_e0), 1e3*(sdp_now()-sdp_e1));
+         if (full_measurement.buffers.empty()) {
+             last_compute_status_ = GGML_STATUS_ALLOC_FAILED;
+             return std::nullopt;
+@@ -1038,6 +1051,7 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
+             return fail_segment("output cache allocation");
+         }
+         new_cache_bytes = add_bytes(last ? 0 : cut_cache_.estimate_output_bytes(graph, segment), cache_.pending_bytes(segment_graph));
++        SDP_MARK(sdp_a0);
+         if (!workspace_.allocate(segment_graph, [&](ggml_backend_sched_t scheduler, ggml_cgraph* current) {
+                 pin_multi_device_nodes(scheduler, current);
+             })) {
+@@ -1053,7 +1067,9 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
+         if (!ensure_capacity()) {
+             return fail_segment("allocated capacity check");
+         }
++        SDP_MARK(sdp_a1);
+         copy_data_to_backend_tensor(segment_graph, false);
++        SDP_MARK(sdp_a2);
+         auto prefetch_requests = memory_requests(measurement.buffers, new_cache_bytes);
+         if (!prefetch_requests.empty()) {
+             weights.enqueue_next(index, prefetch_requests.front());
+@@ -1063,6 +1079,7 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
+         if (!execute_segment(segment_graph, n_threads, [&]() { weights.submit_next(); })) {
+             return fail_segment("execution");
+         }
++        if (sdp_on) fprintf(stderr, "SDP   alloc=%.1fms copyin=%.1fms run=%.1fms\n", 1e3*(sdp_a1-sdp_a0), 1e3*(sdp_a2-sdp_a1), 1e3*(sdp_now()-sdp_a2));
+         auto cache_status = cache_.capture(segment_graph);
+         if (cache_status == GGML_STATUS_SUCCESS) {
+             cache_status = cut_cache_.capture(graph, segment, get_desc().c_str());
 diff --git a/src/core/util.cpp b/src/core/util.cpp
 index 0eeaa41..8d8a158 100644
 --- a/src/core/util.cpp
