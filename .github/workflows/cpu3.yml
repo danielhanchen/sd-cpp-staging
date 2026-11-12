@@ -13,18 +13,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - leg: linux_x64
-            runner: ubuntu-latest
-            defines: "-DGGML_NATIVE=ON"
-            flags: ""
           - leg: macos15
             runner: macos-15
             defines: "-DSD_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=Apple -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0"
             flags: "--backend cpu"
-          - leg: linux_arm64
-            runner: ubuntu-24.04-arm
-            defines: "-DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 -DGGML_NATIVE=ON"
-            flags: ""
     env:
       CCACHE_MAXSIZE: 4G
     steps:
