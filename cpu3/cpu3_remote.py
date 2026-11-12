@@ -89,12 +89,16 @@ def build(defines, jobs, arms):
         for e in extra:  # prof_ggml.patch applies inside ggml/, prof_sd.patch at the root
             sh(["git", "apply", str(HERE / e)], cwd=src / "ggml" if "ggml" in e else src)
         rev = sh(["git", "rev-parse", "HEAD"], cwd=src).strip()
+        with open(src / "examples/CMakeLists.txt", "a") as f:  # scratch conv microbench target, not part of the arm
+            f.write(f'\nadd_executable(conv_bench "{HERE / "conv_bench.cpp"}")\n'
+                    'target_link_libraries(conv_bench PRIVATE ggml ${CMAKE_THREAD_LIBS_INIT})\n'
+                    'target_compile_features(conv_bench PUBLIC cxx_std_17)\n')
         b = W / "build"
         log = ART / f"build_{name}.log"
         t0 = time.time()
         sh(["cmake", "-S", str(src), "-B", str(b), "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", "-DSD_BUILD_EXAMPLES=ON",
             "-DSD_SERVER_BUILD_FRONTEND=OFF", "-DSD_WEBP=OFF", "-DSD_WEBM=OFF", *defines, *launcher], log=log, env=env)
-        sh(["cmake", "--build", str(b), "-j", str(jobs), "--target", "sd-cli"], log=log, env=env)
+        sh(["cmake", "--build", str(b), "-j", str(jobs), "--target", "sd-cli", "conv_bench"], log=log, env=env)
         keep = W / f"bin_{name}"
         if keep.exists():
             shutil.rmtree(keep)
@@ -194,6 +198,31 @@ def ab(bins, cases, threads, reps, flags, arms):
             f.unlink()
 
 
+def cbench(bins, threads, reps, cases):
+    out = ART / "cbench"; out.mkdir(exist_ok=True)
+    nt = threads or (os.cpu_count() or 4)
+    rows = []
+    arms = [a for a in bins if a != "prof"]
+    for c in cases:
+        for rep in range(reps):
+            for arm in (arms if rep % 2 == 0 else arms[::-1]):
+                exe = str(Path(bins[arm]["bin"]) / "conv_bench")
+                p = subprocess.run([exe, str(nt), "3", c, str(out / f"{c}_{arm}.bin")], stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, text=True)
+                m = re.search(r"best ([\d.]+) ms ([\d.]+) GFLOPS", p.stdout)
+                r = dict(case=c, arm=arm, rep=rep, rc=p.returncode, best_ms=float(m.group(1)) if m else None,
+                         gflops=float(m.group(2)) if m else None)
+                say("cbench", json.dumps(r)); rows.append(r)
+        ref = (out / f"{c}_base.bin").read_bytes() if (out / f"{c}_base.bin").exists() else None
+        for arm in arms[1:]:
+            f = out / f"{c}_{arm}.bin"
+            eq = ref is not None and f.exists() and f.read_bytes() == ref
+            rows.append(dict(case=c, arm=arm, bitexact_vs_base=eq)); say("cbench", c, arm, "bitexact_vs_base", eq)
+        for f in out.glob(f"{c}_*.bin"):
+            f.unlink()
+    json.dump(rows, open(ART / "cbench.json", "w"), indent=1)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--defines", default="")
@@ -205,13 +234,15 @@ def main():
     ap.add_argument("--prof-cases", default="k2_512,k2_1024,k3_512,wan")
     ap.add_argument("--ab-cases", default="k2_512")
     ap.add_argument("--ab-reps", type=int, default=3)
+    ap.add_argument("--cbench-cases", default="c128,c512,w96")
     a = ap.parse_args()
     steps = a.steps.split(",")
     info = host_info(); json.dump(info, open(ART / "host.json", "w"), indent=1); say(json.dumps(info)[:600])
     bins = build(shlex.split(a.defines), a.jobs, a.arms.split(","))
     json.dump(bins, open(ART / "bins.json", "w"), indent=1)
     flags = shlex.split(a.flags)
-    for step, fn in (("prof", lambda: prof(bins, a.prof_cases.split(","), a.threads, flags)),
+    for step, fn in (("cbench", lambda: cbench(bins, a.threads, 3, a.cbench_cases.split(","))),
+                     ("prof", lambda: prof(bins, a.prof_cases.split(","), a.threads, flags)),
                      ("ab", lambda: ab(bins, a.ab_cases.split(","), a.threads, a.ab_reps, flags, list(bins)))):
         if step in steps:
             try:

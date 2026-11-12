@@ -1,1 +1,1 @@
---steps build,ab --arms base=cpu3-base,t5=cpu3-t5,head=cpu3-head --ab-cases k2_512,wan_small --ab-reps 3
+--steps build,cbench,ab --arms base=cpu3-base,t5=cpu3-t5,head=cpu3-head --ab-cases k2_512,wan_small --ab-reps 3
