@@ -85,6 +85,9 @@ KINDS = {
     "arm86": ["-DCMAKE_C_COMPILER=gcc-14", "-DCMAKE_CXX_COMPILER=g++-14", "-DGGML_NATIVE=OFF",
               "-DGGML_CPU_ARM_ARCH=armv8.6-a+dotprod+fp16+i8mm"],
     "x64native": ["-DGGML_NATIVE=ON"],
+    # Windows x64 bundle (MSVC): CPU variants picked at startup, as win-cpu-x64 builds it
+    "win_x64_dl": ["-DCMAKE_CXX_FLAGS=/bigobj", "-DSD_BUILD_SHARED_LIBS=ON", "-DSD_BUILD_SHARED_GGML_LIB=ON", "-DBUILD_SHARED_LIBS=ON",
+                   "-DGGML_BACKEND_DL=ON", "-DGGML_CPU_ALL_VARIANTS=ON", "-DGGML_NATIVE=OFF"],
 }
 
 

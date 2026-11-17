@@ -1,0 +1,39 @@
+name: armwsmsvc
+on:
+  push:
+    branches: ['sdrc-armwsmsvc-*']
+permissions:
+  contents: read
+jobs:
+  leg:
+    name: windows_x64_msvc
+    runs-on: windows-2022
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with: {path: h}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - name: tools
+        shell: pwsh
+        run: |
+          choco install ninja --no-progress
+          python -m pip install -q numpy pillow
+          (Get-CimInstance Win32_Processor | Select-Object -First 1).Name
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1.13.0
+        with:
+          arch: x64
+      - name: run
+        shell: bash
+        run: |
+          set -o pipefail
+          python -u h/armws/armws_remote.py --arms m=armws-master:win_x64_dl,b=armws-b:win_x64_dl --runs m=m,b=b --ref m \
+            --types q8_0,q4_0,q5_0,q4_1,iq4_nl,q4_K,q6_K,q3_K --shapes 3072,3072,512/1024,1024,64/3072,3072,8 --steps qmm --reps 2 2>&1 | tee run.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: armws-windows_x64_msvc
+          path: |
+            art
+            run.log
+          retention-days: 7
