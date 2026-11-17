@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright 2026-present the Unsloth AI Inc. team.
 
-name: Unsloth SD prebuilt (CPU/Apple/CUDA/Vulkan)
+name: "armi8mm-prebuilt (staging: Windows CPU legs of unsloth-sd-prebuilt.yml)"
 
 # Build and publish our stable-diffusion.cpp (sd-cli + sd-server) prebuilts for
 # CPU, Apple, CUDA, and Vulkan. MiniMax-H3 uses the native engine on GPU hosts too.
