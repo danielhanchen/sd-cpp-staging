@@ -1,0 +1,135 @@
+name: nov21-metal
+on:
+  push:
+    branches: ['nov21-metal-*']
+permissions:
+  contents: read
+env:
+  BASE_SHA: 27b9ddc
+  PR93: eaeda981ab8fc6b4e8fed4adbef7d77ac716701e
+  PR94: ece7faad4c97f380625f8e359cc6f1a550e59405
+  PR95: f97cd25c1ed52ce0781bb1dec886871a9ccaa02c
+  PR98: 72ea46443e5e93bddc5afe87262c7e3227294b1e
+jobs:
+  build:
+    name: build-${{ matrix.arm }}
+    runs-on: macos-15
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [base, head]
+    steps:
+      - name: Source
+        run: |
+          set -eux
+          git clone -q https://github.com/unslothai/stable-diffusion.cpp src && cd src && git checkout -q $BASE_SHA
+          if [ "${{ matrix.arm }}" = head ]; then
+            for n in 93 94 95 98; do git fetch -q origin pull/$n/head:pr$n; done
+            for v in PR93 PR94 PR95 PR98; do n=${v#PR}; test "$(git rev-parse pr$n)" = "${!v}"; done
+            git -c user.name=ci -c user.email=ci@example.com merge -q --no-edit pr93 pr94 pr95 pr98
+          fi
+          git log --oneline -6
+          git submodule update --init --depth 1 ggml
+          for p in scripts/unsloth/ggml-patches/*.patch; do git -C ggml apply "../$p"; done
+          ls scripts/unsloth/ggml-patches | tail -8
+      - name: Build sd-cli (shipped macOS arm64 defines, static)
+        working-directory: src
+        run: |
+          set -eux
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_EXAMPLES=ON -DSD_SERVER_BUILD_FRONTEND=OFF -DSD_WEBP=OFF -DSD_WEBM=OFF \
+            -DGGML_NATIVE=OFF -DSD_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=Apple \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 > cfg.log 2>&1 || { tail -60 cfg.log; exit 1; }
+          cmake --build build --config Release -j "$(sysctl -n hw.logicalcpu)" --target sd-cli > build.log 2>&1 || { grep -E "error|Error" build.log | head -60; exit 1; }
+          mkdir -p ../out && cp "$(find build -name sd-cli -type f | head -1)" ../out/ && otool -L ../out/sd-cli
+      - name: Build test-backend-ops (same patched ggml)
+        working-directory: src
+        run: |
+          set -eux
+          cmake -S ggml -B build-ggml -DCMAKE_BUILD_TYPE=Release -DGGML_BUILD_TESTS=ON -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DGGML_BLAS=OFF -DGGML_NATIVE=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 > cfg2.log 2>&1 || { tail -60 cfg2.log; exit 1; }
+          cmake --build build-ggml --config Release -j "$(sysctl -n hw.logicalcpu)" --target test-backend-ops > build2.log 2>&1 || { grep -E "error|Error" build2.log | head -60; exit 1; }
+          cp "$(find build-ggml -name test-backend-ops -type f | head -1)" ../out/ && otool -L ../out/test-backend-ops
+      - uses: actions/upload-artifact@v4
+        with: {name: "bin-${{ matrix.arm }}", path: out/, retention-days: 5}
+  ops:
+    needs: build
+    name: ops-${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-26]
+    steps:
+      - uses: actions/download-artifact@v4
+        with: {pattern: "bin-*", path: bins}
+      - name: test-backend-ops (Metal vs CPU)
+        run: |
+          set -x
+          mkdir -p res; chmod +x bins/*/*
+          { sysctl hw.model hw.memsize hw.ncpu machdep.cpu.brand_string; sw_vers; system_profiler SPDisplaysDataType; } > res/host.txt 2>&1; cat res/host.txt
+          for arm in base head; do
+            B=bins/bin-$arm/test-backend-ops
+            $B support -b MTL0 -o IM2COL_3D,IM2COL,CONV_3D,ROPE,RMS_NORM,FLASH_ATTN_EXT > res/support_$arm.txt 2>&1
+            for op in IM2COL_3D CONV_3D IM2COL ROPE RMS_NORM FLASH_ATTN_EXT; do
+              /usr/bin/time -p $B test -b MTL0 -o $op -j 3 > res/test_${arm}_${op}.txt 2>&1; echo "$arm $op rc=$?" | tee -a res/rc.txt
+              tail -3 res/test_${arm}_${op}.txt
+            done
+            # tensor-API FA forced on (the default is M5+ only); reports whether this GPU can run it at all
+            GGML_METAL_TENSOR_ENABLE=1 /usr/bin/time -p $B test -b MTL0 -o FLASH_ATTN_EXT -j 3 > res/test_${arm}_FA_tensor.txt 2>&1; echo "$arm FA_tensor rc=$?" | tee -a res/rc.txt
+            grep -E "has tensor|tensor API" res/test_${arm}_FA_tensor.txt | head -5
+            tail -3 res/test_${arm}_FA_tensor.txt
+            GGML_METAL_TENSOR_ENABLE=1 $B perf -b MTL0 -o FLASH_ATTN_EXT -p "hsk=128,hsv=128" > res/perf_${arm}_FA_tensor.txt 2>&1
+            $B perf -b MTL0 -o FLASH_ATTN_EXT -p "hsk=128,hsv=128" > res/perf_${arm}_FA.txt 2>&1
+            $B perf -b MTL0 -o IM2COL_3D,CONV_3D > res/perf_${arm}_conv3d.txt 2>&1
+          done
+          cat res/rc.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: "ops-${{ matrix.runner }}", path: res/, retention-days: 5}
+  render:
+    needs: build
+    runs-on: macos-15
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with: {path: head, sparse-checkout: .github}
+      - uses: actions/download-artifact@v4
+        with: {pattern: "bin-*", path: binsraw}
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - name: Models
+        run: |
+          set -eux
+          mkdir -p bins/base bins/head && cp binsraw/bin-base/* bins/base/ && cp binsraw/bin-head/* bins/head/ && chmod +x bins/*/*
+          python -m pip install -q huggingface_hub hf_xet numpy pillow
+          mkdir -p models
+          python - <<'PY'
+          import os
+          from huggingface_hub import hf_hub_download
+          files = [("unsloth/Z-Image-Turbo-GGUF", "z-image-turbo-Q4_K_M.gguf"), ("unsloth/FLUX.1-schnell", "ae.safetensors"),
+                   ("unsloth/Qwen3-4B-GGUF", "Qwen3-4B-Q4_K_M.gguf"),
+                   ("samuelchristlie/Wan2.1-T2V-1.3B-GGUF", "Wan2.1-T2V-1.3B-Q4_K_M.gguf"),
+                   ("Comfy-Org/Wan_2.1_ComfyUI_repackaged", "split_files/vae/wan_2.1_vae.safetensors"),
+                   ("city96/umt5-xxl-encoder-gguf", "umt5-xxl-encoder-Q3_K_S.gguf")]
+          for repo, f in files:
+              p = hf_hub_download(repo, f)
+              dst = os.path.join("models", os.path.basename(f))
+              if not os.path.exists(dst):
+                  os.symlink(os.path.realpath(p), dst)
+              print(repo, f, os.path.getsize(p))
+          PY
+          ls -laL models; df -h .
+      - name: Renders (ABBA)
+        run: |
+          set -o pipefail
+          python -u head/.github/nov21metal/render.py --bins bins --models models --out res --reps 3 2>&1 | tee render.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: render
+          retention-days: 5
+          path: |
+            res/
+            render.log
