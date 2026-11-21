@@ -1,0 +1,59 @@
+name: nov21-metal
+on:
+  push:
+    branches: ['nov21-metal-*']
+    paths-ignore: ['nothing']
+permissions:
+  contents: read
+  actions: read
+env:
+  BASE_SHA: 27b9ddc
+  PR93: eaeda981ab8fc6b4e8fed4adbef7d77ac716701e
+  PR94: ece7faad4c97f380625f8e359cc6f1a550e59405
+  PR95: f97cd25c1ed52ce0781bb1dec886871a9ccaa02c
+  PR98: 72ea46443e5e93bddc5afe87262c7e3227294b1e
+jobs:
+  render:
+    runs-on: macos-15
+    timeout-minutes: 200
+    steps:
+      - uses: actions/checkout@v4
+        with: {path: head, sparse-checkout: .github}
+      - uses: actions/download-artifact@v4
+        with: {pattern: "bin-*", path: binsraw, run-id: 44920741649, github-token: "${{ github.token }}", repository: danielhanchen/sd-cpp-staging}
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - name: Models
+        run: |
+          set -eux
+          mkdir -p bins/base bins/head bins/fix && cp binsraw/bin-base/* bins/base/ && cp binsraw/bin-head/* bins/head/ && cp binsraw/bin-fix/* bins/fix/ && chmod +x bins/*/*
+          python -m pip install -q huggingface_hub hf_xet numpy pillow
+          mkdir -p models
+          python - <<'PY'
+          import os
+          from huggingface_hub import hf_hub_download
+          files = [("unsloth/Z-Image-Turbo-GGUF", "z-image-turbo-Q4_K_M.gguf"), ("unsloth/FLUX.1-schnell", "ae.safetensors"),
+                   ("unsloth/Qwen3-4B-GGUF", "Qwen3-4B-Q4_K_M.gguf"),
+                   ("samuelchristlie/Wan2.1-T2V-1.3B-GGUF", "Wan2.1-T2V-1.3B-Q4_K_M.gguf"),
+                   ("Comfy-Org/Wan_2.1_ComfyUI_repackaged", "split_files/vae/wan_2.1_vae.safetensors"),
+                   ("city96/umt5-xxl-encoder-gguf", "umt5-xxl-encoder-Q3_K_S.gguf")]
+          for repo, f in files:
+              p = hf_hub_download(repo, f)
+              dst = os.path.join("models", os.path.basename(f))
+              if not os.path.exists(dst):
+                  os.symlink(os.path.realpath(p), dst)
+              print(repo, f, os.path.getsize(p))
+          PY
+          ls -laL models; df -h .
+      - name: Renders (ABBA)
+        run: |
+          set -o pipefail
+          python -u head/.github/nov21metal/render3.py --bins bins --models models --out res 2>&1 | tee render.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: render
+          retention-days: 5
+          path: |
+            res/
+            render.log
