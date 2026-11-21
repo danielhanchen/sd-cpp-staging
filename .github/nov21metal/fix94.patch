@@ -1,0 +1,36 @@
+diff --git a/src/core/metal/rope.mm b/src/core/metal/rope.mm
+index 1ca576a..be9e374 100644
+--- a/src/core/metal/rope.mm
++++ b/src/core/metal/rope.mm
+@@ -80,8 +80,12 @@ namespace sd_metal_rope {
+             return false;
+         const auto* x      = norm->src[0];
+         const auto* weight = mul->src[1];
+-        // The row is staged in threadgroup memory and reduced as float4, like ggml's rms_norm_f32_4.
+-        return x && weight && weight != norm && x->type == GGML_TYPE_F32 && norm->type == GGML_TYPE_F32 &&
++        // The row is staged in threadgroup memory and reduced as float4, like ggml's rms_norm_f32_4, so every
++        // row (and the weight) must start on a 16-byte boundary.
++        if (!x || !weight || x->view_offs % 16 || uintptr_t(x->data) % 16 || uintptr_t(weight->data) % 16 || x->nb[1] % 16 || x->nb[2] % 16 ||
++            x->nb[3] % 16)
++            return false;
++        return weight != norm && x->type == GGML_TYPE_F32 && norm->type == GGML_TYPE_F32 &&
+                mul->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) &&
+                x->ne[0] % 4 == 0 && x->ne[0] <= 1024 && ggml_are_same_shape(x, norm) && ggml_are_same_shape(norm, mul) &&
+                weight->ne[0] == x->ne[0] && ggml_nelements(weight) == x->ne[0] && ggml_is_contiguous(weight);
+@@ -298,11 +302,14 @@ void sd_ggml_register_metal_rope(ggml_backend_dev_t device) {
+         desc.execute              = execute;
+         desc.user_data            = kernels.get();
+         GGML_ASSERT(ggml_ext_register_kernel(device, &desc));
+-        // The reduction keeps one partial sum per 32-wide SIMD group.
++        // The reduction keeps one partial sum per 32-wide SIMD group and needs simd_sum: the same families
++        // ggml requires for its own RMS_NORM (has_simdgroup_reduction). The paravirtual GPU of macOS VMs
++        // reports Apple5 and has no SIMD-group reduction.
+         auto fusable = [](id<MTLComputePipelineState> p) {
+             return p && p.threadExecutionWidth == 32;
+         };
+-        if (fusable(kernels->fused) && fusable(kernels->fused_16)) {
++        const bool simd_reduction = [metal supportsFamily:MTLGPUFamilyApple7] || [metal supportsFamily:MTLGPUFamilyMetal3];
++        if (simd_reduction && fusable(kernels->fused) && fusable(kernels->fused_16)) {
+             desc.name      = "sd.rms_norm_mul_rope.metal.v1";
+             desc.op        = GGML_OP_RMS_NORM;
+             desc.custom_op = nullptr;
