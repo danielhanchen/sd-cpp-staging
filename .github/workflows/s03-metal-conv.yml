@@ -1,0 +1,93 @@
+name: s03-metal-conv
+on:
+  push:
+    branches: ['s03-*']
+permissions:
+  contents: read
+  actions: read
+env:
+  # the Darwin-macOS-arm64 leg of unsloth-sd-prebuilt.yml
+  REL_DEFS: "-DSD_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=Apple -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0"
+jobs:
+  build:
+    name: build-${{ matrix.name }}
+    runs-on: macos-15
+    timeout-minutes: 90
+    strategy:
+      matrix:
+        name: [base, head]
+    steps:
+      - uses: actions/checkout@v4
+        with: {path: src}
+      - name: Source (fork tree + its ggml-patches [+ s03 patches] + inert harness diag)
+        working-directory: src
+        run: |
+          set -eux
+          git log -1 --oneline
+          git submodule update --init --depth 1 ggml
+          git -C ggml log -1 --oneline
+          for p in scripts/unsloth/ggml-patches/*.patch; do git -C ggml apply "../$p"; done
+          if [ "${{ matrix.name }}" = head ]; then
+            for p in .github/s03/patches/*.patch; do git -C ggml apply --verbose "../$p"; done
+          fi
+          python3 .github/s03/diag.py ggml
+          git -C ggml diff --stat | tail -3
+          echo "arm=${{ matrix.name }} sha=$(git rev-parse HEAD) ggml=$(git -C ggml rev-parse HEAD) mm=$(grep -c kernel_conv_2d_mm ggml/src/ggml-metal/kernels/conv.metal)" > ../srcinfo.txt
+      - name: Build
+        working-directory: src
+        run: |
+          set -euo pipefail
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_EXAMPLES=ON -DSD_SERVER_BUILD_FRONTEND=OFF \
+            -DSD_WEBP=OFF -DSD_WEBM=OFF -DGGML_NATIVE=OFF -DGGML_BUILD_TESTS=ON $REL_DEFS > cmake.log 2>&1 || { tail -50 cmake.log; exit 1; }
+          N=$(sysctl -n hw.logicalcpu)
+          cmake --build build --config Release -j "$N" --target sd-cli test-backend-ops > build.log 2>&1 || { grep -E "error" build.log | head -40; exit 1; }
+          mkdir -p ../out && cp build/bin/sd-cli ../out/ && cp ../srcinfo.txt ../out/
+          cp "$(find build -name test-backend-ops -type f | head -1)" ../out/
+          ls -la ../out
+      - uses: actions/upload-artifact@v4
+        with: {name: "bin-${{ matrix.name }}", path: out/, retention-days: 5}
+  bench:
+    needs: build
+    name: bench
+    runs-on: macos-15
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with: {path: h, sparse-checkout: .github}
+      - uses: actions/download-artifact@v4
+        with: {path: dl, pattern: "bin-*"}
+      - name: Binaries + host
+        run: |
+          set -eux
+          for d in dl/bin-*; do v="${d#dl/bin-}"; mkdir -p bin/$v; cp $d/* bin/$v/; chmod +x bin/$v/*; done
+          mkdir -p results
+          { cat bin/*/srcinfo.txt; sysctl hw.model hw.memsize hw.ncpu machdep.cpu.brand_string; sw_vers; system_profiler SPDisplaysDataType; } > results/host.txt 2>&1 || true
+          cat results/host.txt
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - run: python -m pip install -q numpy pillow
+      - name: Model
+        run: |
+          set -eux
+          mkdir -p models
+          curl -fsSL --retry 5 --retry-all-errors -o models/sd_turbo-f16.gguf https://huggingface.co/Green-Sky/SD-Turbo-GGUF/resolve/main/sd_turbo-f16.gguf
+          shasum -a 256 models/* | tee results/models.sha256
+      - name: test-backend-ops CONV_2D (Metal vs CPU)
+        run: |
+          set +e
+          to() { perl -e '$t=shift; alarm $t; exec @ARGV or die' "$@"; }
+          for v in base head; do
+            echo "=== $v forced simdgroup"; GGML_METAL_FORCE_SIMDGROUP=1 to 1800 bin/$v/test-backend-ops test -b MTL0 -o CONV_2D > results/tbo_${v}_test_simd.log 2>&1; echo "rc=$?" | tee -a results/tbo_${v}_test_simd.log; grep -E "tests passed|FAIL" results/tbo_${v}_test_simd.log | tail -5
+            echo "=== $v device default"; to 1800 bin/$v/test-backend-ops test -b MTL0 -o CONV_2D > results/tbo_${v}_test_dev.log 2>&1; echo "rc=$?" | tee -a results/tbo_${v}_test_dev.log; grep -E "tests passed|FAIL" results/tbo_${v}_test_dev.log | tail -5
+          done
+          for v in head base; do
+            echo "=== $v perf (VAE shapes)"; GGML_METAL_FORCE_SIMDGROUP=1 to 1500 bin/$v/test-backend-ops perf -b MTL0 -o CONV_2D -p "padding0=1" > results/tbo_${v}_perf.log 2>&1; echo "rc=$?" | tee -a results/tbo_${v}_perf.log; grep "us/run" results/tbo_${v}_perf.log
+          done
+          true
+      - name: VAE decode A/B 1024 px
+        run: python -u h/.github/s03/bench.py --bin-dir bin --model models/sd_turbo-f16.gguf --out results/r1024 --res 1024 --reps 3 --slow-timeout 900 2>&1 | tee results/r1024.log
+      - name: VAE decode A/B 512 px
+        run: python -u h/.github/s03/bench.py --bin-dir bin --model models/sd_turbo-f16.gguf --out results/r512 --res 512 --reps 3 --slow-timeout 600 2>&1 | tee results/r512.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: "res-s03", path: results/, retention-days: 7}
