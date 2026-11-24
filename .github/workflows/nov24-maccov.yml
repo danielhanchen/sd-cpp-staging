@@ -1,0 +1,71 @@
+name: nov24-maccov
+on:
+  push:
+    branches: ['nov24-maccov-*']
+permissions:
+  contents: read
+env:
+  STUDIO_SHA: 2c06e74929d2449bf3c808d6d6d7528f2542d205
+  HF_HUB_DISABLE_TELEMETRY: "1"
+  HF_HUB_DISABLE_PROGRESS_BARS: "1"
+  PYTHONUNBUFFERED: "1"
+jobs:
+  mps:
+    runs-on: macos-15
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with: {path: head}
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - name: Host
+        run: |
+          mkdir -p results
+          { sysctl hw.model hw.memsize hw.ncpu machdep.cpu.brand_string; sw_vers; vm_stat | head -5; df -h .; } 2>&1 | tee results/host.txt
+          echo "HF_HOME=$RUNNER_TEMP/hf" >> "$GITHUB_ENV"
+      - name: Studio venv (unsloth main ${{ env.STUDIO_SHA }}, Studio's Mac requirement files)
+        run: |
+          set -eux
+          python -m pip install -q uv
+          git init -q unsloth && git -C unsloth remote add origin https://github.com/unslothai/unsloth
+          git -C unsloth fetch -q --depth 1 origin $STUDIO_SHA && git -C unsloth checkout -q FETCH_HEAD
+          uv venv -q --python "$(which python)" venv_studio
+          R=unsloth/studio/backend/requirements
+          O="--override $R/single-env/overrides-darwin-arm64.txt"
+          PY=venv_studio/bin/python
+          uv pip install -q --python $PY "torch==2.13.0" "torchvision" "torchaudio"
+          uv pip install -q --python $PY $O -r $R/no-torch-runtime.txt
+          uv pip install -q --python $PY $O --no-deps -r $R/extras-no-deps.txt
+          uv pip install -q --python $PY $O -r $R/studio.txt
+          uv pip install -q --python $PY $O -r $R/diffusers-pin.txt
+          grep -qv '^#' $R/diffusers-main.txt && uv pip install -q --python $PY $O -r $R/diffusers-main.txt || true
+          uv pip install -q --python $PY av psutil
+          $PY -c "import torch, diffusers, transformers; print('studio', torch.__version__, diffusers.__version__, transformers.__version__, 'mps', torch.backends.mps.is_available())" | tee results/versions.txt
+      - name: Builder venv (tiny packs from the real unsloth/* configs; transformers 5.15.1 for the Gemma 4 encoder)
+        run: |
+          set -euxo pipefail
+          uv venv -q --python "$(which python)" venv_build
+          PB=venv_build/bin/python
+          uv pip install -q --python $PB "torch==2.13.0" "diffusers==0.42.1" "transformers==5.15.1" "huggingface_hub>=1.8" safetensors accelerate tiktoken pillow
+          $PB -u head/maccov/build_tiny.py --out tiny --backend unsloth/studio/backend ltx-2.5 2>&1 | grep -v -i "warn" | tee results/build.log
+          du -sh tiny/*
+      - name: Render each family through Studio's backend on MPS (PYTORCH_ENABLE_MPS_FALLBACK unset)
+        run: |
+          set +e
+          unset PYTORCH_ENABLE_MPS_FALLBACK
+          PY=venv_studio/bin/python
+          export UNSLOTH_STUDIO_HOME=$RUNNER_TEMP/studio_home
+          for spec in "ltx-2.5 video"; do
+            set -- $spec
+            echo "::group::$1"
+            env UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD=1 /usr/bin/time -l perl -e 'alarm shift; exec @ARGV' 1800 $PY -u head/maccov/run_family.py --backend unsloth/studio/backend --pack tiny/$1 \
+              --family $1 --kind $2 --size 512 --frames 17 --steps 2 --out results/$1.json > results/$1.log 2>&1
+            echo "exit $?" >> results/$1.log
+            grep -E "RESULT|exit " results/$1.log; tail -25 results/$1.log
+            echo "::endgroup::"
+          done
+          grep -h RESULT results/*.log | tee results/summary.txt
+          true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: maccov, path: results/, retention-days: 7}
