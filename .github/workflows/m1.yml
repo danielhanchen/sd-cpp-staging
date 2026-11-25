@@ -1,0 +1,59 @@
+name: m1-mac
+on:
+  push:
+    branches: ['m1-*']
+permissions:
+  contents: read
+env:
+  STUDIO_SHA: ce5a979d231a9c6d5d4861ebed585a27d2dc4d60
+  SDCPP_SHA: 6667be652926c21f2191ab4fa17506178e2108cc
+  HF_HUB_DISABLE_TELEMETRY: "1"
+  HF_HUB_DISABLE_PROGRESS_BARS: "1"
+  PYTHONUNBUFFERED: "1"
+jobs:
+  sdcpp_build:
+    runs-on: macos-15
+    timeout-minutes: 300
+    steps:
+      - name: leejet/stable-diffusion.cpp at #2403 merge (6667be65)
+        run: |
+          set -eux
+          git init -q src && git -C src remote add origin https://github.com/leejet/stable-diffusion.cpp
+          git -C src fetch -q --depth 1 origin $SDCPP_SHA && git -C src checkout -q FETCH_HEAD
+          git -C src submodule update --init --depth 1 ggml || git -C src submodule update --init ggml
+          git -C src log -1 --oneline; git -C src/ggml log -1 --oneline
+      - name: Build (Darwin arm64 release flags)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_EXAMPLES=ON -DSD_SERVER_BUILD_FRONTEND=OFF -DSD_WEBP=OFF -DSD_WEBM=OFF \
+            -DGGML_NATIVE=OFF -DSD_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=Apple -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 > cmake.log 2>&1 || { tail -60 cmake.log; exit 1; }
+          cmake --build build --config Release -j "$(sysctl -n hw.logicalcpu)" --target sd-cli > build.log 2>&1 || { grep -E "error" build.log | head -40; tail -30 build.log; exit 1; }
+          mkdir -p ../out && cp build/bin/sd-cli ../out/ && git rev-parse HEAD > ../out/sha.txt
+      - uses: actions/checkout@v4
+        with: {path: h}
+      - run: mkdir -p bin && cp out/* bin/
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - name: Models (klein 4B INT8 ConvRot ComfyUI, Qwen3-4B Q3_K_M, flux2 VAE, r32 LoRA)
+        run: |
+          set -eux
+          chmod +x bin/sd-cli; python -m pip install -q numpy pillow
+          mkdir -p models loras results
+          { sysctl hw.model hw.memsize hw.ncpu; sw_vers; cat bin/sha.txt; } | tee results/host.txt
+          dl() { curl -fsSL --retry 5 --retry-all-errors -o "$1" "$2"; }
+          dl models/klein4b_i8cr.safetensors https://huggingface.co/wraps/FLUX.2-klein-4B-INT8-ConvRot-ComfyUI/resolve/main/flux-2-klein-4b-int8-convrot.safetensors
+          dl models/qwen3_4b_q3km.gguf https://huggingface.co/unsloth/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q3_K_M.gguf
+          dl models/flux2_vae.safetensors https://huggingface.co/Comfy-Org/flux2-klein-4B/resolve/main/split_files/vae/flux2-vae.safetensors
+          dl loras/r32.safetensors https://huggingface.co/thedeoxen/refcontrol-FLUX.2-klein-4B-reference-depth-lora/resolve/main/flux2_klein_4b_refcontrol_depth.safetensors
+          shasum -a 256 models/* loras/* | tee results/models.sha256
+      - name: A/B none / at_runtime / immediately, 3 rounds interleaved, 512 px 4 steps
+        run: |
+          set +e
+          python -u h/m1/sdbench.py --bin bin/sd-cli --out results/klein \
+            --model-args "--diffusion-model models/klein4b_i8cr.safetensors --vae models/flux2_vae.safetensors --llm models/qwen3_4b_q3km.gguf" \
+            --lora-dir loras --lora r32 --size 512 --steps 4 --rounds 3 2>&1 | tee results/klein.log
+          true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: res-sdcpp, path: results/, retention-days: 7}
