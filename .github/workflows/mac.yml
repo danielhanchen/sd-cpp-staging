@@ -1,0 +1,41 @@
+name: r6n3-mac
+on:
+  push:
+    branches: ['r6n3-mac-*']
+permissions:
+  contents: read
+env:
+  HF_HUB_DISABLE_TELEMETRY: "1"
+  PYTHONUNBUFFERED: "1"
+jobs:
+  qwen_causal_pad:
+    runs-on: macos-15
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        torch: ["torch>=2.13,<2.14", "torch>=2.14,<2.15"]
+    steps:
+      - uses: actions/checkout@v4
+        with: {path: h}
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - name: venv
+        run: |
+          set -eux
+          mkdir -p results
+          python -m venv v && v/bin/pip install -q "${{ matrix.torch }}" "diffusers==0.42.1" transformers accelerate numpy pillow
+          v/bin/python -c "import torch;print(torch.__version__, torch.backends.mps.is_available())" | tee results/host.txt
+      - name: interleaved arms, fresh process each (stock, zero_buffer) x 3, then 3 latent frames once each
+        run: |
+          set +e
+          for r in 0 1 2; do for arm in stock zero_buffer; do
+            v/bin/python -u h/mac/mps_qwen_pad.py --dd h/mac/dd --arm $arm --out results/${arm}_r$r.json --latent 64 --n 20
+          done; done
+          for arm in stock zero_buffer; do
+            v/bin/python -u h/mac/mps_qwen_pad.py --dd h/mac/dd --arm $arm --out results/${arm}_f3.json --latent 48 --n 10 --frames 3
+          done
+          true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: "res-${{ strategy.job-index }}", path: results/, retention-days: 7}
