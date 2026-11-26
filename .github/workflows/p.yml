@@ -1,0 +1,28 @@
+name: c17probe
+on:
+  push:
+    branches: ['r8c1734-*']
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: probe
+        run: |
+          sudo apt-get update -qq; sudo apt-get install -y -qq linux-tools-common "linux-tools-$(uname -r)"
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+          P=$(ls /usr/lib/linux-tools/*/perf | head -1); $P --version
+          cat > busy.py <<'PY'
+          import threading,time
+          def f():
+              t=time.time(); x=0
+              while time.time()-t<2: x+=1
+          ts=[threading.Thread(target=f) for _ in range(3)]; [t.start() for t in ts]; [t.join() for t in ts]
+          PY
+          for ev in cpu-clock cpu-clock:u task-clock task-clock:u cpu-clock:k cycles; do for cg in dwarf,8192 fp none; do
+            if [ $cg = none ]; then CG=""; else CG="--call-graph $cg"; fi
+            $P record -e $ev -F 49 $CG -o t.data -- python3 busy.py > o.txt 2>&1; rc=$?
+            n=$($P script -i t.data 2>/dev/null | grep -c python3)
+            echo "EV=$ev CG=$cg rc=$rc lines=$n :: $(tail -2 o.txt | tr '\n' ' ' | cut -c1-200)"
+            python3 busy.py & BP=$!; sleep 0.2; $P record -e $ev -F 49 $CG -p $BP -o t2.data > o2.txt 2>&1 & PP=$!; sleep 1; kill -INT $PP; wait $PP; rc=$?; wait $BP
+            echo "   ATTACH rc=$rc samples=$($P script -i t2.data 2>/dev/null | grep -c python3) :: $(tail -1 o2.txt | cut -c1-160)"
+          done; done
