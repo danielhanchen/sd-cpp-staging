@@ -272,6 +272,8 @@ def main():
     meta = {"torch": torch.__version__, "diffusers": diffusers.__version__, "device": a.device,
             "mps_available": torch.backends.mps.is_available(), "res": a.res, "tile": a.tile, "iters": a.iters}
     print(meta, flush=True)
+    if a.device == "mps" and not meta["mps_available"]:
+        sys.exit("MPS not available: VOID")
     rows = []
     op_level(H3, cfg, a.device, a.tile, a.iters, f"tile{a.tile}", rows)
     json.dump({"meta": meta, "ops": rows}, open(os.path.join(a.out, "ops.json"), "w"), indent=1)

@@ -16,7 +16,7 @@ jobs:
         run: |
           set -eux
           python -m pip install -q --upgrade pip
-          python -m pip install -q torch numpy
+          python -m pip install -q torch==2.14.1 numpy  # 2.15 skips the runner's paravirtual GPU (no Metal 2.0)
           python -m pip install -q "diffusers==0.42.1" transformers accelerate || python -m pip install -q "diffusers==0.43.0" transformers accelerate
           mkdir -p res
           { sysctl hw.model hw.memsize hw.ncpu machdep.cpu.brand_string; sw_vers; python -c "import torch,diffusers;print(torch.__version__, diffusers.__version__, torch.backends.mps.is_available())"; } > res/host.txt 2>&1; cat res/host.txt
