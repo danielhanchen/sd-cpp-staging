@@ -7,6 +7,7 @@ permissions:
 env:
   # fail an allocation cleanly instead of swapping the 7.5 GB runner to death
   PYTORCH_MPS_HIGH_WATERMARK_RATIO: '0.8'
+  PYTORCH_MPS_LOW_WATERMARK_RATIO: '0.6'
   RUN: python -u s08/s08_mps.py --device mps --cfg s08/vae_config.json --studio-dir s08/studio
 jobs:
   mps:
