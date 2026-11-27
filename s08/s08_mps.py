@@ -70,6 +70,8 @@ def err_in_bf16_ulps(x, ref, floor_frac=1e-3):
         "p999_raw": torch.quantile(raw.flatten()[:: max(1, raw.numel() // 2_000_000)].float(), 0.999).item(),
         "frac_gt1_raw": (raw > 1).double().mean().item(),
         "max_abs": d.max().item(),
+        # elements off by more than 1e-3 of the output's range: a wrong result, not rounding
+        "frac_bad": (d > 1e-3 * ref.abs().max()).double().mean().item(),
     }
 
 
@@ -163,7 +165,7 @@ def op_level(H3, cfg, dev, res, iters, label, rows):
                     assert ys.shape == yl.shape, (ys.shape, yl.shape)
                     r = {"bitwise_equal": bool(torch.equal(ys, yl))}
                     if dt is torch.bfloat16:
-                        u = ulp_bf16_pair(ys, yl)
+                        u = ulp_bf16_pair(ys.cpu(), yl.cpu())
                         r["stock_vs_lowered_max_ulp"] = u.max().item()
                         r["stock_vs_lowered_frac_gt1ulp"] = (u > 1).double().mean().item()
                         r["stock_vs_lowered_frac_ne"] = (u > 0).double().mean().item()
@@ -204,9 +206,12 @@ def vae_level(H3, cfg, dev, res, iters, out):
     kw["decoder_num_layers"] = 1  # not on the encode path; keeps the random model small
     torch.manual_seed(0)
     vae = AutoencoderKLMiniMaxH3(**kw).eval()
+    vae.decoder = torch.nn.Identity()  # encode only
     res_out = {"encoder_params_M": sum(p.numel() for p in vae.encoder.parameters()) / 1e6}
     torch.manual_seed(1)
     img = torch.rand(1, 3, 1, res, res) * 2 - 1
+    with torch.no_grad():
+        ref = vae.encode(img).latent_dist.mean.double()  # stock Conv3d, CPU fp32
     for dt_name, dt in (("fp32", torch.float32), ("bf16", torch.bfloat16)):
         r = {}
         try:
@@ -235,11 +240,13 @@ def vae_level(H3, cfg, dev, res, iters, out):
             r["latent_max_abs"] = (ys.float() - yl.float()).abs().max().item()
             r["latent_max_rel"] = r["latent_max_abs"] / max(ys.float().abs().max().item(), 1e-30)
             if dt is torch.bfloat16:
-                u = ulp_bf16_pair(ys.to(torch.bfloat16), yl.to(torch.bfloat16))
+                u = ulp_bf16_pair(ys.to(torch.bfloat16).cpu(), yl.to(torch.bfloat16).cpu())
                 r["latent_max_ulp_bf16"] = u.max().item()
                 r["latent_frac_gt1ulp"] = (u > 1).double().mean().item()
             else:
                 r["latent_bf16ulps"] = err_in_bf16_ulps(yl.cpu(), ys.cpu().double())
+            r["stock_vs_cpu32"] = err_in_bf16_ulps(ys.cpu(), ref)
+            r["lowered_vs_cpu32"] = err_in_bf16_ulps(yl.cpu(), ref)
             r["stock_s"], r["lowered_s"] = t_s[0], t_l[0]
             r["stock_minmax"], r["lowered_minmax"] = t_s[1:], t_l[1:]
             r["speedup"] = t_s[0] / t_l[0]
@@ -264,6 +271,7 @@ def main():
     ap.add_argument("--vae-iters", type=int, default=5)
     ap.add_argument("--skip-full", action="store_true", help="skip the untiled res^2 op set")
     ap.add_argument("--skip-vae", action="store_true")
+    ap.add_argument("--skip-ops", action="store_true")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     H3 = load_studio(a.studio_dir)
@@ -275,6 +283,10 @@ def main():
     if a.device == "mps" and not meta["mps_available"]:
         sys.exit("MPS not available: VOID")
     rows = []
+    if a.skip_ops:
+        vae = vae_level(H3, cfg, a.device, a.res, a.vae_iters, a.out)
+        json.dump({"meta": meta, "vae": vae}, open(os.path.join(a.out, "vae.json"), "w"), indent=1)
+        return
     op_level(H3, cfg, a.device, a.tile, a.iters, f"tile{a.tile}", rows)
     json.dump({"meta": meta, "ops": rows}, open(os.path.join(a.out, "ops.json"), "w"), indent=1)
     if not a.skip_full:
