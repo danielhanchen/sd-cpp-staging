@@ -198,65 +198,76 @@ def op_level(H3, cfg, dev, res, iters, label, rows):
               f"maxulp {b.get('stock_vs_lowered_max_ulp')} err {f.get('error', '')}{b.get('error', '')}", flush=True)
 
 
-def vae_level(H3, cfg, dev, res, iters, out):
+def build_vae(cfg):
     from diffusers import AutoencoderKLMiniMaxH3
-    from diffusers.models.autoencoders.autoencoder_kl_minimax_h3 import MiniMaxH3VideoCausalConv3d
 
     kw = {k: v for k, v in cfg.items() if not k.startswith("_")}
     kw["decoder_num_layers"] = 1  # not on the encode path; keeps the random model small
     torch.manual_seed(0)
     vae = AutoencoderKLMiniMaxH3(**kw).eval()
     vae.decoder = torch.nn.Identity()  # encode only
-    res_out = {"encoder_params_M": sum(p.numel() for p in vae.encoder.parameters()) / 1e6}
     torch.manual_seed(1)
-    img = torch.rand(1, 3, 1, res, res) * 2 - 1
+    img = torch.rand(1, 3, 1, cfg["_res"], cfg["_res"]) * 2 - 1
+    return vae, img
+
+
+def vae_arm(H3, cfg, dev, arm, dt_name, iters, out):
+    """one arm (stock | lowered | cpuref) of a real-config random-weight encode; latent saved for compare"""
+    from diffusers.models.autoencoders.autoencoder_kl_minimax_h3 import MiniMaxH3VideoCausalConv3d
+
+    dt = {"fp32": torch.float32, "bf16": torch.bfloat16}[dt_name]
+    vae, img = build_vae(cfg)
+    r = {"arm": arm, "dtype": dt_name, "encoder_params_M": sum(p.numel() for p in vae.encoder.parameters()) / 1e6}
+    if arm == "cpuref":
+        dev, dt = "cpu", torch.float32
+    v = vae.to(dev, dt)
+    x = img.to(dev, dt)
+    calls = {}
+    if arm == "lowered":
+        for m in v.encoder.modules():
+            if isinstance(m, MiniMaxH3VideoCausalConv3d):
+                m.forward = H3._single_frame_conv_forward(m, calls)
+    t0 = time.perf_counter()
     with torch.no_grad():
-        ref = vae.encode(img).latent_dist.mean.double()  # stock Conv3d, CPU fp32
-    for dt_name, dt in (("fp32", torch.float32), ("bf16", torch.bfloat16)):
-        r = {}
-        try:
-            v = vae.to(dev, dt)
-            x = img.to(dev, dt)
-            enc_convs = [m for m in v.encoder.modules() if isinstance(m, MiniMaxH3VideoCausalConv3d)]
-            for m in enc_convs:
-                m.__dict__.pop("forward", None)
-            with torch.no_grad():
-                ys = v.encode(x).latent_dist.mean
-                sync(dev)
-                t_s = time_fn(lambda: v.encode(x), dev, iters, warmup=1)
-                calls = {}
-                for m in enc_convs:
-                    m.forward = H3._single_frame_conv_forward(m, calls)
-                yl = v.encode(x).latent_dist.mean
-                sync(dev)
-                n_after_one = calls.get(H3.LEVER_ROCM_SINGLE_FRAME_ENCODER, 0)
-                t_l = time_fn(lambda: v.encode(x), dev, iters, warmup=1)
-                for m in enc_convs:
-                    m.__dict__.pop("forward", None)
-            r["lowered_conv_calls_per_encode"] = n_after_one
-            r["wrapped_convs"] = len(enc_convs)
-            r["latent_shape"] = list(ys.shape)
-            r["bitwise_equal"] = bool(torch.equal(ys, yl))
-            r["latent_max_abs"] = (ys.float() - yl.float()).abs().max().item()
-            r["latent_max_rel"] = r["latent_max_abs"] / max(ys.float().abs().max().item(), 1e-30)
-            if dt is torch.bfloat16:
-                u = ulp_bf16_pair(ys.to(torch.bfloat16).cpu(), yl.to(torch.bfloat16).cpu())
-                r["latent_max_ulp_bf16"] = u.max().item()
-                r["latent_frac_gt1ulp"] = (u > 1).double().mean().item()
-            else:
-                r["latent_bf16ulps"] = err_in_bf16_ulps(yl.cpu(), ys.cpu().double())
-            r["stock_vs_cpu32"] = err_in_bf16_ulps(ys.cpu(), ref)
-            r["lowered_vs_cpu32"] = err_in_bf16_ulps(yl.cpu(), ref)
-            r["stock_s"], r["lowered_s"] = t_s[0], t_l[0]
-            r["stock_minmax"], r["lowered_minmax"] = t_s[1:], t_l[1:]
-            r["speedup"] = t_s[0] / t_l[0]
-        except Exception as exc:  # noqa: BLE001
-            r["error"] = f"{type(exc).__name__}: {exc}"[:400]
-        if dev == "mps":
-            torch.mps.empty_cache()
-        res_out[dt_name] = r
-        print(f"[vae {res}^2 {dt_name}] {json.dumps(r)}", flush=True)
-    return res_out
+        y = v.encode(x).latent_dist.mean
+        sync(dev)
+        r["first_s"] = time.perf_counter() - t0
+        r["lowered_conv_calls_first_encode"] = calls.get(H3.LEVER_ROCM_SINGLE_FRAME_ENCODER, 0)
+        if arm != "cpuref" and iters > 0:
+            t = time_fn(lambda: v.encode(x), dev, iters, warmup=0)
+            r["median_s"], r["min_s"], r["max_s"] = t
+    if dev == "mps":
+        r["mps_driver_alloc_GB"] = torch.mps.driver_allocated_memory() / 2**30
+    r["latent_shape"] = list(y.shape)
+    torch.save(y.cpu(), os.path.join(out, f"latent_{arm}_{dt_name}.pt"))
+    json.dump(r, open(os.path.join(out, f"vae_{arm}_{dt_name}.json"), "w"), indent=1)
+    print(f"[vae {arm} {dt_name}] {json.dumps(r)}", flush=True)
+
+
+def vae_compare(out):
+    ref = torch.load(os.path.join(out, "latent_cpuref_fp32.pt")).double()
+    res = {}
+    for dt_name in ("fp32", "bf16"):
+        lat = {a: os.path.join(out, f"latent_{a}_{dt_name}.pt") for a in ("stock", "lowered")}
+        if not all(os.path.exists(p) for p in lat.values()):
+            continue
+        ys, yl = (torch.load(lat[a]) for a in ("stock", "lowered"))
+        r = {"bitwise_equal": bool(torch.equal(ys, yl)),
+             "stock_vs_lowered_max_abs": (ys.double() - yl.double()).abs().max().item(),
+             "stock_vs_cpu32": err_in_bf16_ulps(ys, ref), "lowered_vs_cpu32": err_in_bf16_ulps(yl, ref)}
+        if dt_name == "fp32":
+            r["stock_vs_lowered_bf16ulps"] = err_in_bf16_ulps(yl, ys.double())
+        else:
+            u = ulp_bf16_pair(ys.to(torch.bfloat16), yl.to(torch.bfloat16))
+            r["stock_vs_lowered_max_ulp"], r["stock_vs_lowered_frac_gt1ulp"] = u.max().item(), (u > 1).double().mean().item()
+        t = {a: json.load(open(os.path.join(out, f"vae_{a}_{dt_name}.json"))) for a in ("stock", "lowered")}
+        r["stock_median_s"], r["lowered_median_s"] = t["stock"].get("median_s"), t["lowered"].get("median_s")
+        if r["stock_median_s"] and r["lowered_median_s"]:
+            r["speedup"] = r["stock_median_s"] / r["lowered_median_s"]
+        r["lowered_conv_calls_first_encode"] = t["lowered"]["lowered_conv_calls_first_encode"]
+        res[dt_name] = r
+        print(f"[vae compare {dt_name}] {json.dumps(r)}", flush=True)
+    json.dump(res, open(os.path.join(out, "vae_compare.json"), "w"), indent=1)
 
 
 def main():
@@ -271,7 +282,8 @@ def main():
     ap.add_argument("--vae-iters", type=int, default=5)
     ap.add_argument("--skip-full", action="store_true", help="skip the untiled res^2 op set")
     ap.add_argument("--skip-vae", action="store_true")
-    ap.add_argument("--skip-ops", action="store_true")
+    ap.add_argument("--vae-arm", choices=["stock", "lowered", "cpuref", "compare"])
+    ap.add_argument("--vae-dtype", default="fp32", choices=["fp32", "bf16"])
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     H3 = load_studio(a.studio_dir)
@@ -280,20 +292,22 @@ def main():
     meta = {"torch": torch.__version__, "diffusers": diffusers.__version__, "device": a.device,
             "mps_available": torch.backends.mps.is_available(), "res": a.res, "tile": a.tile, "iters": a.iters}
     print(meta, flush=True)
-    if a.device == "mps" and not meta["mps_available"]:
+    if a.device == "mps" and a.vae_arm not in ("cpuref", "compare") and not meta["mps_available"]:
         sys.exit("MPS not available: VOID")
     rows = []
-    if a.skip_ops:
-        vae = vae_level(H3, cfg, a.device, a.res, a.vae_iters, a.out)
-        json.dump({"meta": meta, "vae": vae}, open(os.path.join(a.out, "vae.json"), "w"), indent=1)
+    if a.vae_arm == "compare":
+        vae_compare(a.out)
+        return
+    if a.vae_arm:
+        cfg["_res"] = a.res
+        vae_arm(H3, cfg, a.device, a.vae_arm, a.vae_dtype, a.vae_iters, a.out)
         return
     op_level(H3, cfg, a.device, a.tile, a.iters, f"tile{a.tile}", rows)
     json.dump({"meta": meta, "ops": rows}, open(os.path.join(a.out, "ops.json"), "w"), indent=1)
     if not a.skip_full:
         op_level(H3, cfg, a.device, a.res, a.iters, f"full{a.res}", rows)
         json.dump({"meta": meta, "ops": rows}, open(os.path.join(a.out, "ops.json"), "w"), indent=1)
-    vae = None if a.skip_vae else vae_level(H3, cfg, a.device, a.res, a.vae_iters, a.out)
-    json.dump({"meta": meta, "ops": rows, "vae": vae}, open(os.path.join(a.out, "ops.json"), "w"), indent=1)
+    json.dump({"meta": meta, "ops": rows}, open(os.path.join(a.out, "ops.json"), "w"), indent=1)
 
 
 if __name__ == "__main__":
