@@ -23,26 +23,18 @@ jobs:
           python -m pip install -q --upgrade pip
           python -m pip install -q torch==2.14.1 numpy  # 2.15 skips the runner's paravirtual GPU (no Metal 2.0)
           python -m pip install -q "diffusers==0.42.1" transformers accelerate
-          mkdir -p res/vae
+          mkdir -p res/vae256
           { sysctl hw.model hw.memsize hw.ncpu machdep.cpu.brand_string; sw_vers; python -c "import torch,diffusers;print(torch.__version__, diffusers.__version__, torch.backends.mps.is_available())"; } > res/host.txt 2>&1; cat res/host.txt
-      - name: Step 1 tile ops (MPS)
+      - name: Step 2b one 256 tile encode, stock first (default watermark)
+        timeout-minutes: 30
+        env: {PYTORCH_MPS_HIGH_WATERMARK_RATIO: '', PYTORCH_MPS_LOW_WATERMARK_RATIO: ''}
         run: |
-          set -o pipefail
-          $RUN --out res/tile --tile 256 --iters 20 --skip-full --skip-vae 2>&1 | tee res/tile.log
-      - uses: actions/upload-artifact@v4
-        if: ${{ always() }}
-        with: {name: s08-tile, path: res/, retention-days: 7}
-      - name: Step 2 VAE encode 1024 reference, one arm per process
-        if: ${{ !cancelled() }}
-        run: |
-          set -o pipefail
-          $RUN --out res/vae --res 1024 --vae-arm cpuref 2>&1 | tee -a res/vae.log
-          for dt in fp32 bf16; do
-            for arm in lowered stock; do
-              $RUN --out res/vae --res 1024 --vae-iters 3 --vae-arm $arm --vae-dtype $dt 2>&1 | tee -a res/vae.log || echo "arm $arm $dt rc=$?" | tee -a res/vae.log
-            done
+          unset PYTORCH_MPS_HIGH_WATERMARK_RATIO PYTORCH_MPS_LOW_WATERMARK_RATIO
+          $RUN --out res/vae256 --res 256 --vae-arm cpuref 2>&1 | tee -a res/vae256.log
+          for arm in stock lowered; do
+            $RUN --out res/vae256 --res 256 --vae-iters 3 --vae-arm $arm --vae-dtype fp32 2>&1 | tee -a res/vae256.log || echo "arm $arm rc=$?" | tee -a res/vae256.log
           done
-          $RUN --out res/vae --vae-arm compare 2>&1 | tee -a res/vae.log
+          $RUN --out res/vae256 --vae-arm compare 2>&1 | tee -a res/vae256.log
       - uses: actions/upload-artifact@v4
         if: ${{ always() }}
-        with: {name: s08-vae, path: res/vae*, retention-days: 7}
+        with: {name: s08-vae256, path: res/vae256*, retention-days: 7}
